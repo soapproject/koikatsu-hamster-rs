@@ -3,12 +3,19 @@
 use crate::plan::is_in_dest_folder;
 use std::path::{Path, PathBuf};
 
-/// Every `.png` under `root`, excluding this program's own output folders.
+/// Every `.png` under `root`, excluding this program's own output folders, in
+/// sorted order.
 ///
 /// Iterative rather than recursive: a pathological directory tree must not be able
 /// to overflow the stack, for the same reason the msgpack decoder caps its depth.
 /// Directories that cannot be read are skipped — one unreadable folder is not a
 /// reason to abandon the scan.
+///
+/// Symlinks and, on Windows, directory junctions are never descended into.
+/// `DirEntry::file_type` does not follow the link, so `is_symlink()` is true for
+/// both without touching the target — a junction pointing at an ancestor
+/// (common in real Windows user profiles) would otherwise make the scan re-read
+/// the same subtree forever, since nothing else here tracks visited paths.
 pub fn candidates(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -16,21 +23,29 @@ pub fn candidates(root: &Path) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let mut found: Vec<PathBuf> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                // Reparse point (symlink or, on Windows, a junction/mount
+                // point) — never descend, and never treat it as a candidate
+                // file either. Cheap: no extra filesystem call, and it is
+                // exactly what stops a cycle back to an ancestor.
+                continue;
+            }
             if ft.is_dir() {
                 if !is_in_dest_folder(root, &path) {
                     stack.push(path);
                 }
             } else if ft.is_file() && has_png_extension(&path) {
-                found.push(path);
+                out.push(path);
             }
         }
-        found.sort();
-        out.extend(found);
     }
+    // The traversal order (stack pop order, filesystem enumeration order
+    // within a directory) is not meaningful on its own — pin down the
+    // documented "deterministic order" by sorting the whole result once.
+    out.sort();
     out
 }
 
@@ -123,7 +138,14 @@ mod tests {
         touch(d.path(), "Koikatu/Female/already.png");
 
         let cwd = std::env::current_dir().unwrap();
-        let rel_root = pathdiff(d.path(), &cwd);
+        let Some(rel_root) = pathdiff(d.path(), &cwd) else {
+            eprintln!(
+                "note: skipping a_relative_root_still_skips_its_own_output_folders — \
+                 the temp directory and the current directory are on different \
+                 Windows drives, so no relative path between them exists"
+            );
+            return;
+        };
 
         assert_eq!(names(&rel_root), ["a.png"]);
     }
@@ -132,9 +154,24 @@ mod tests {
     /// components. Both inputs are expected to be absolute (temp dirs and
     /// `current_dir()` both are), so no `..`-walking symlink resolution is
     /// needed — just component comparison.
-    fn pathdiff(to: &Path, from: &Path) -> std::path::PathBuf {
+    ///
+    /// Returns `None` when `to` and `from` disagree on Windows drive (or,
+    /// more generally, path-prefix) — there is no relative path across
+    /// drives, and silently building one by counting `..`s anyway would
+    /// produce a nonsense path that quietly checks the wrong thing instead
+    /// of failing loudly.
+    fn pathdiff(to: &Path, from: &Path) -> Option<std::path::PathBuf> {
         let to_comps: Vec<_> = to.components().collect();
         let from_comps: Vec<_> = from.components().collect();
+
+        if let (Some(std::path::Component::Prefix(tp)), Some(std::path::Component::Prefix(fp))) =
+            (to_comps.first(), from_comps.first())
+        {
+            if tp.as_os_str() != fp.as_os_str() {
+                return None;
+            }
+        }
+
         let common = to_comps
             .iter()
             .zip(from_comps.iter())
@@ -150,6 +187,77 @@ mod tests {
         if result.as_os_str().is_empty() {
             result.push(".");
         }
-        result
+        Some(result)
+    }
+
+    /// Pins the Critical fix: a directory symlink (or, on Windows, a
+    /// junction) pointing back at an ancestor must not send the scan into an
+    /// infinite loop. `entry.file_type()` never follows the link, so
+    /// `is_symlink()` is true for the link itself without ever resolving the
+    /// target — exactly the cheap check `candidates` needs in order to
+    /// refuse to descend, with no visited-set and no `canonicalize` calls.
+    ///
+    /// Creating a directory symlink on Windows normally needs elevation or
+    /// Developer Mode. If that fails here, the test prints a note and
+    /// returns rather than failing the whole suite — the guard in
+    /// `candidates` is unconditional either way, this just leaves the cycle
+    /// itself unverified on such a machine.
+    #[test]
+    fn a_directory_symlink_pointing_at_an_ancestor_does_not_loop_forever() {
+        let d = Dir::new();
+        touch(d.path(), "a.png");
+        touch(d.path(), "sub/b.png");
+        let link = d.path().join("sub").join("loop_back_to_root");
+
+        #[cfg(windows)]
+        let made_link = std::os::windows::fs::symlink_dir(d.path(), &link).is_ok();
+        #[cfg(unix)]
+        let made_link = std::os::unix::fs::symlink(d.path(), &link).is_ok();
+        #[cfg(not(any(windows, unix)))]
+        let made_link = false;
+
+        if !made_link {
+            eprintln!(
+                "note: skipping a_directory_symlink_pointing_at_an_ancestor_does_not_loop_forever \
+                 — could not create a directory symlink in this environment (on Windows this \
+                 needs elevation or Developer Mode); the reparse-point guard in `candidates` is \
+                 still in place, just unverified by this run"
+            );
+            return;
+        }
+
+        assert_eq!(names(d.path()), ["a.png", "sub/b.png"]);
+    }
+
+    /// The Important fix: `candidates` must return a fully, deterministically
+    /// sorted `Vec`, not just sorted within each directory. Unlike every
+    /// other test in this file, this asserts the RAW return value —
+    /// `names()` sorts before comparing, which is exactly what let the
+    /// unsorted-across-directories bug through unnoticed. The tree below is
+    /// built so sorted order does not match the depth-first / LIFO order the
+    /// old code produced (root's subdirectories are visited stack-LIFO, so
+    /// "z" would surface before "a" without the final sort).
+    #[test]
+    fn returns_the_full_result_sorted_not_just_sorted_within_each_directory() {
+        let d = Dir::new();
+        touch(d.path(), "z/first.png");
+        touch(d.path(), "a/second.png");
+        touch(d.path(), "a/deep/inner.png");
+        touch(d.path(), "m.png");
+
+        let raw: Vec<String> = candidates(d.path())
+            .iter()
+            .map(|p| {
+                p.strip_prefix(d.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        assert_eq!(
+            raw,
+            ["a/deep/inner.png", "a/second.png", "m.png", "z/first.png"]
+        );
     }
 }
