@@ -193,8 +193,13 @@ impl<'a, R: Read + Seek> StreamCur<'a, R> {
         if n > self.remaining {
             return Err(CardError::Malformed("truncated card".into()));
         }
+        // `n` is bounded by `remaining` above, and `remaining` is seeded from a
+        // real file's length, so this is unreachable in practice — but `skip` is
+        // a general helper, not something that gets to assume its only caller
+        // passes a positive `i32`. Guarded rather than cast-and-hope.
+        let delta = i64::try_from(n).map_err(|_| CardError::Malformed("skip length overflow".into()))?;
         self.r
-            .seek(SeekFrom::Current(n as i64))
+            .seek(SeekFrom::Current(delta))
             .map_err(|e| CardError::Io(e.to_string()))?;
         self.remaining -= n;
         Ok(())
@@ -280,10 +285,21 @@ pub fn read_card_from<R: Read + Seek>(r: &mut R) -> Result<CardMeta, CardError> 
             c.r.seek(SeekFrom::Start(off))
                 .map_err(|e| CardError::Io(e.to_string()))?;
             c.remaining = len;
-            if let Ok(s) = c.string() {
-                if looks_like_version(&s) {
-                    return Err(CardError::Scene(s));
-                }
+            match c.string() {
+                Ok(s) if looks_like_version(&s) => return Err(CardError::Scene(s)),
+                Ok(_) => {}
+                // A genuine I/O failure while re-reading for the scene probe must
+                // still surface as `Io`, never get laundered into `Unrecognized`
+                // — exactly the silent-drop class `payload_span`'s doc comment
+                // warns about (a share blinking, a lock taken mid-scan), just one
+                // call frame further out now that this probe re-reads the file
+                // instead of an already-slurped buffer.
+                Err(e @ CardError::Io(_)) => return Err(e),
+                // The probe's own read failing structurally (truncated, a bad
+                // length prefix) says nothing about whether this is a scene —
+                // fall through and report the marker as unrecognized, same as
+                // before streaming.
+                Err(_) => {}
             }
             return Err(CardError::Unrecognized(marker));
         }
@@ -382,17 +398,26 @@ mod tests {
     use super::*;
     use crate::counting_reader::CountingReader;
     use crate::fixture;
+    use crate::seek_trap::SeekTrap;
     use crate::tempdir::Dir;
     use std::io::{Cursor, Write};
 
     /// Guards the point of this whole branch: parsing a card must stream from
-    /// the reader instead of slurping the entire appended payload into memory.
-    /// The 16 MiB tail below sits after the Parameter block — nothing a correct
-    /// parse needs — mirroring how a real card's face image and any padding
-    /// after it dwarf the handful of bytes `read_card_from` actually needs.
+    /// the reader instead of slurping the entire appended payload into memory,
+    /// AND must actually skip the embedded face image rather than reading it.
+    ///
+    /// The face image is 64 KiB — comfortably larger than the byte budget
+    /// below, so a regression that turned `StreamCur::skip` back into a read
+    /// (the earlier version of this parser's actual behaviour) fails this
+    /// assertion on its own, without needing the 16 MiB tail at all. The tail
+    /// stays for the other regression it catches: a reintroduced whole-payload
+    /// `read_to_end`. The bound itself — a few KiB — is sized from what the
+    /// parse genuinely needs (a few hundred bytes, per the fixed-size fields,
+    /// the small block table, and the `Parameter` block), not loosened to
+    /// whatever happened to pass.
     #[test]
     fn parsing_a_card_does_not_read_its_whole_payload() {
-        let mut bytes = fixture::card("【KoiKatuChara】", 1, "姬野", "夜王");
+        let mut bytes = fixture::card_with_face("【KoiKatuChara】", 1, "姬野", "夜王", 64 * 1024);
         bytes.extend(std::iter::repeat(0u8).take(16 * 1024 * 1024));
         let mut cr = CountingReader::new(Cursor::new(bytes));
 
@@ -402,10 +427,57 @@ mod tests {
         assert_eq!(m.sex, Sex::Female);
         assert_eq!(m.fullname(), "姬野 夜王");
         assert!(
-            cr.bytes_read() < 256 * 1024,
-            "expected under 256 KiB actually read, got {} bytes",
+            cr.bytes_read() < 4 * 1024,
+            "expected under 4 KiB actually read, got {} bytes",
             cr.bytes_read()
         );
+    }
+
+    /// The face-image skip is otherwise exercised by no test: `fixture::card`
+    /// hard-codes a zero-length face, so a wrong sign, a missing `remaining`
+    /// decrement, or a no-op skip would all ship green while silently shifting
+    /// every read after it — landing the `Parameter` block read on the wrong
+    /// offset. The consequence is not a crash but a misfile: `sex` comes back
+    /// `Unknown` and a real character card lands in `{Game}/Unknown` instead of
+    /// `Female`/`Male`. This pins the parse still lands correctly with a
+    /// realistically-sized (non-zero) face image in the way.
+    #[test]
+    fn a_non_zero_face_image_is_skipped_without_disturbing_the_rest_of_the_parse() {
+        let bytes = fixture::card_with_face("【KoiKatuChara】", 1, "姬野", "夜王", 4096);
+        let mut r = Cursor::new(bytes);
+        let m = read_card_from(&mut r).expect("card");
+        assert_eq!(m.game, Game::Koikatu);
+        assert_eq!(m.route, Route::BySex);
+        assert_eq!(m.sex, Sex::Female);
+        assert_eq!(m.fullname(), "姬野 夜王");
+    }
+
+    /// Before streaming, the scene probe re-examined an already-slurped buffer,
+    /// so it could only fail `Malformed` — any real I/O failure had already
+    /// surfaced as `Io` from the earlier `read_to_end`. Streaming made the probe
+    /// re-read the file from disk, opening a window where a share blinking
+    /// during that rewind must still surface as `Io` and not get laundered into
+    /// `Unrecognized` (which `main::run` counts as `unrecognized`, prints
+    /// "Skipped …" for, and leaves `errors` at zero for — silently not filing a
+    /// card the run claims succeeded). `SeekTrap` fails every read issued after
+    /// the SECOND seek to the payload's start offset, which is exactly the
+    /// probe's rewind — the first read of the marker, before the rewind, must
+    /// still succeed.
+    #[test]
+    fn an_io_failure_during_the_scene_probe_rewind_surfaces_as_io_not_unrecognized() {
+        let bytes = fixture::card("【SomeFutureGame】", 1, "a", "b");
+        let off = {
+            let mut probe = Cursor::new(bytes.clone());
+            payload_span(&mut probe)
+                .expect("no I/O error")
+                .expect("a payload is present")
+                .0
+        };
+        let mut r = SeekTrap::new(Cursor::new(bytes), off);
+        match read_card_from(&mut r) {
+            Err(CardError::Io(_)) => {}
+            other => panic!("expected Io, got {other:?}"),
+        }
     }
 
     fn file(d: &Dir, name: &str, bytes: &[u8]) -> std::path::PathBuf {

@@ -81,7 +81,17 @@ pub fn plain_png() -> Vec<u8> {
 }
 
 /// A character or coordinate card. `sex` is written into the Parameter block.
+/// The embedded face image is empty — see `card_with_face` for the shape where
+/// it is not, which is the shape every real card actually has.
 pub fn card(marker: &str, sex: u8, lastname: &str, firstname: &str) -> Vec<u8> {
+    card_with_face(marker, sex, lastname, firstname, 0)
+}
+
+/// Same layout as `card`, but with a `face_len`-byte embedded face image
+/// between `faceLen` and the block table — the shape a real card has, where
+/// the face image is the bulk of the appended bytes and is the thing
+/// `read_card_from` must seek past rather than read.
+pub fn card_with_face(marker: &str, sex: u8, lastname: &str, firstname: &str, face_len: usize) -> Vec<u8> {
     let parameter = mp_map(&[
         ("version", mp_str("0.0.5")),
         ("sex", mp_uint(sex as u64)),
@@ -97,12 +107,17 @@ pub fn card(marker: &str, sex: u8, lastname: &str, firstname: &str) -> Vec<u8> {
             ("size", mp_uint(parameter.len() as u64)),
         ])]),
     )]);
+    // Not all-zero: a skip that silently turned into a no-op (rather than
+    // actually moving the read position) would otherwise still happen to land
+    // on plausible-looking bytes by coincidence with an all-zero face.
+    let face: Vec<u8> = (0..face_len).map(|i| (i % 256) as u8).collect();
 
     let mut p = Vec::new();
     p.extend_from_slice(&100i32.to_le_bytes()); // ProductNo
     p.extend(dotnet_string(marker));
     p.extend(dotnet_string("0.0.0")); // loadVersion — the old layout, still valid
-    p.extend_from_slice(&0i32.to_le_bytes()); // faceLen
+    p.extend_from_slice(&(face_len as i32).to_le_bytes()); // faceLen
+    p.extend_from_slice(&face);
     p.extend_from_slice(&(table.len() as i32).to_le_bytes());
     p.extend_from_slice(&table);
     p.extend_from_slice(&(parameter.len() as i64).to_le_bytes()); // total

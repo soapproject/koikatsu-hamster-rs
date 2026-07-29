@@ -8,6 +8,8 @@ mod counting_reader;
 #[cfg(test)]
 mod fixture;
 #[cfg(test)]
+mod seek_trap;
+#[cfg(test)]
 mod tempdir;
 
 use crate::card::{read_card, CardError};
