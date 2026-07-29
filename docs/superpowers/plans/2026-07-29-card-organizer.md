@@ -1471,6 +1471,12 @@ use std::path::{Path, PathBuf};
 /// to overflow the stack, for the same reason the msgpack decoder caps its depth.
 /// Directories that cannot be read are skipped — one unreadable folder is not a
 /// reason to abandon the scan.
+///
+/// Reparse points are never descended into. On Windows a directory junction reports
+/// `is_dir() == true`, because that reads `FILE_ATTRIBUTE_DIRECTORY`, which junctions
+/// also set; one pointing at an ancestor would make this loop forever. `DirEntry`'s
+/// `file_type` does not follow the link, so `is_symlink()` catches both symlinks and
+/// junctions — much cheaper than canonicalising every directory into a visited set.
 pub fn candidates(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -1478,21 +1484,25 @@ pub fn candidates(root: &Path) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let mut found: Vec<PathBuf> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
             if ft.is_dir() {
                 if !is_in_dest_folder(root, &path) {
                     stack.push(path);
                 }
             } else if ft.is_file() && has_png_extension(&path) {
-                found.push(path);
+                out.push(path);
             }
         }
-        found.sort();
-        out.extend(found);
     }
+    // Sorting once at the end is what actually makes the order deterministic: the
+    // stack is LIFO and sibling directories come off `read_dir` in filesystem order,
+    // so per-directory sorting alone would leave the cross-directory order to chance.
+    out.sort();
     out
 }
 
