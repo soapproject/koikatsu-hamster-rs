@@ -571,6 +571,10 @@ git commit -m "feat(png): locate the appended card block by walking the chunk ch
 //!   | i32 tableLen + msgpack block table | i64 total | blocks
 //! Strings use the 7-bit encoded length prefix; every string here is under 128
 //! bytes, so the prefix is a single byte.
+//!
+//! `tests/cli.rs` pulls this same file in with `#[path]`, so each consumer uses a
+//! different subset of the builders.
+#![allow(dead_code)]
 
 fn dotnet_string(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
@@ -1882,78 +1886,17 @@ git commit -m "feat(cli): flags, per-file reporting, summary, terminal-only paus
 
 ```rust
 //! Drives the real executable. A binary crate's modules are unreachable from an
-//! integration test, which is fine: this is the layer where the exit code, the
-//! banner and the redirected-stdin behaviour actually matter.
+//! integration test through `use`, so the fixture builder is pulled in by path —
+//! one source file, compiled into both targets. This is the layer where the exit
+//! code, the banner and the redirected-stdin behaviour actually matter.
+
+#[path = "../src/fixture.rs"]
+mod fixture;
 
 use std::path::Path;
 use std::process::Command;
 
 const EXE: &str = env!("CARGO_BIN_EXE_koikatsu-hamster");
-
-/// Same layout as src/fixture.rs, duplicated because that module is test-only
-/// inside the binary and cannot be imported here. Kept deliberately minimal: only
-/// enough of a card for the binary to classify it.
-fn card(marker: &str, sex: u8) -> Vec<u8> {
-    fn dotnet_string(s: &str) -> Vec<u8> {
-        let b = s.as_bytes();
-        let mut v = vec![b.len() as u8];
-        v.extend_from_slice(b);
-        v
-    }
-    fn mp_str(s: &str) -> Vec<u8> {
-        let b = s.as_bytes();
-        let mut v = vec![0xA0 | b.len() as u8];
-        v.extend_from_slice(b);
-        v
-    }
-    fn mp_map(pairs: &[(&str, Vec<u8>)]) -> Vec<u8> {
-        let mut v = vec![0x80 | pairs.len() as u8];
-        for (k, val) in pairs {
-            v.extend(mp_str(k));
-            v.extend_from_slice(val);
-        }
-        v
-    }
-    let parameter = mp_map(&[
-        ("sex", vec![sex]),
-        ("lastname", mp_str("a")),
-        ("firstname", mp_str("b")),
-    ]);
-    let info = mp_map(&[
-        ("name", mp_str("Parameter")),
-        ("version", mp_str("0.0.5")),
-        ("pos", vec![0]),
-        ("size", vec![parameter.len() as u8]),
-    ]);
-    let mut table = vec![0x81];
-    table.extend(mp_str("lstInfo"));
-    table.push(0x91);
-    table.extend_from_slice(&info);
-
-    let mut p = Vec::new();
-    p.extend_from_slice(&100i32.to_le_bytes());
-    p.extend(dotnet_string(marker));
-    p.extend(dotnet_string("0.0.0"));
-    p.extend_from_slice(&0i32.to_le_bytes());
-    p.extend_from_slice(&(table.len() as i32).to_le_bytes());
-    p.extend_from_slice(&table);
-    p.extend_from_slice(&(parameter.len() as i64).to_le_bytes());
-    p.extend_from_slice(&parameter);
-
-    fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
-        let mut v = (data.len() as u32).to_be_bytes().to_vec();
-        v.extend_from_slice(kind);
-        v.extend_from_slice(data);
-        v.extend_from_slice(&[0, 0, 0, 0]);
-        v
-    }
-    let mut png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-    png.extend(chunk(b"IHDR", &[0; 13]));
-    png.extend(chunk(b"IDAT", &[7; 16]));
-    png.extend(chunk(b"IEND", &[]));
-    png.extend_from_slice(&p);
-    png
-}
 
 fn temp_root(tag: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!("kh-cli-{}-{tag}", std::process::id()));
@@ -1971,8 +1914,8 @@ fn write(root: &Path, rel: &str, bytes: &[u8]) {
 #[test]
 fn organises_a_tree_prints_a_banner_and_exits_zero() {
     let root = temp_root("ok");
-    write(&root, "ISEEU/Genshin/Unknown god/card/god.png", &card("【KoiKatuChara】", 1));
-    write(&root, "pack/Koikatu_F_20240626232405280_x/x.png", &card("【KoiKatuChara】", 0));
+    write(&root, "ISEEU/Genshin/Unknown god/card/god.png", &fixture::card("【KoiKatuChara】", 1, "a", "b"));
+    write(&root, "pack/Koikatu_F_20240626232405280_x/x.png", &fixture::card("【KoiKatuChara】", 0, "a", "b"));
 
     let out = Command::new(EXE)
         .arg("--root")
@@ -2100,7 +2043,8 @@ same five fields. `Route::Fixed(&'static str)` carries the leaf name used by
 Task 7. `walk::candidates`, `plan::is_in_dest_folder`, `plan::free_name`, `png::payload_span` and
 `card::read_card` keep one signature throughout.
 
-**Known duplication.** `tests/cli.rs` re-implements a trimmed card builder because `src/fixture.rs`
-is `#[cfg(test)]` inside a binary crate and integration tests cannot import it. The alternative
-is adding a `lib.rs`, which the design rules out. The duplicate is ~40 lines and only needs to
-build a card the binary can classify.
+**Fixture sharing.** `src/fixture.rs` is `#[cfg(test)]` inside a binary crate, so an integration
+test cannot reach it through `use`. `tests/cli.rs` pulls the same source file in with
+`#[path = "../src/fixture.rs"] mod fixture;` — one file, compiled into both targets, no
+duplicated logic. The file is self-contained (std only), which is what makes that work, and it
+carries `#![allow(dead_code)]` because each consumer uses a different subset of the builders.
