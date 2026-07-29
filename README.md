@@ -65,6 +65,25 @@ directory filter is.
 - The end-of-run key wait happens **only when stdin is a terminal**, so the tool can be scripted.
   Added `--root` and `--dry-run`; exit code is non-zero when any file errored.
 
+## Performance
+
+400 real character cards, 2.30 GB, each tool given its own byte-identical copy, page cache
+warmed over both first, three rounds:
+
+| | round 1 | round 2 | round 3 |
+|---|---|---|---|
+| C# | 0.47 s | 0.39 s | 0.38 s |
+| Rust | 0.22 s | 0.21 s | 0.21 s |
+
+About **1.9× faster**, and both file all 400 cards identically.
+
+Nothing about the language earns that on its own — the first working version was 2.1× *slower*
+than the C# one. A card is parsed from a few hundred bytes near the start of the appended block,
+but that version read the whole payload into memory to get at them: 651 MB read where 20 MB
+would reach the block table, a 32× over-read. Streaming the parse and seeking past the embedded
+face image instead of reading it took one fixture's read volume from 16,777,397 bytes to 181.
+The lesson is that the win came from doing less I/O, not from Rust.
+
 Double-clicking the executable in a folder still walks that folder and moves the cards, exactly
 as before.
 
