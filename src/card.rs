@@ -147,27 +147,66 @@ fn looks_like_version(s: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Cursor over the appended block, mirroring .NET `BinaryReader` primitives.
-struct Cur<'a> {
-    b: &'a [u8],
-    p: usize,
+/// Reads a `Malformed`-mapped error for bytes that should be there but are not:
+/// a genuine I/O failure stays `Io`, but the stream simply ending early — the
+/// streaming equivalent of the old `buf.get(start..end)` coming back `None` — is
+/// the card's own structure being broken, so it is `Malformed`, matching the
+/// slurping code this replaces.
+fn read_exact_mapped<R: Read>(r: &mut R, n: usize) -> Result<Vec<u8>, CardError> {
+    let mut buf = vec![0u8; n];
+    match r.read_exact(&mut buf) {
+        Ok(()) => Ok(buf),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(CardError::Malformed("truncated card".into()))
+        }
+        Err(e) => Err(CardError::Io(e.to_string())),
+    }
 }
 
-impl<'a> Cur<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        let end = self.p.checked_add(n).ok_or("length overflow")?;
-        let s = self.b.get(self.p..end).ok_or("truncated card")?;
-        self.p = end;
-        Ok(s)
+/// Cursor over the appended block that reads lazily from `R`, mirroring .NET
+/// `BinaryReader` primitives — the shape the C# tool this replaces uses to seek
+/// straight to the bytes it needs instead of loading the whole payload.
+///
+/// `remaining` is the number of payload bytes not yet consumed, seeded from the
+/// length `payload_span` measured off the real file. Every read and skip is
+/// checked against it BEFORE touching the reader, so a hostile or corrupt
+/// `faceLen`/table-length can never make this allocate or seek past what the
+/// file actually contains — the same bound `buf.get(start..end)` gave the old
+/// in-memory version for free.
+struct StreamCur<'a, R> {
+    r: &'a mut R,
+    remaining: u64,
+}
+
+impl<'a, R: Read + Seek> StreamCur<'a, R> {
+    fn take(&mut self, n: usize) -> Result<Vec<u8>, CardError> {
+        if n as u64 > self.remaining {
+            return Err(CardError::Malformed("truncated card".into()));
+        }
+        let buf = read_exact_mapped(self.r, n)?;
+        self.remaining -= n as u64;
+        Ok(buf)
     }
-    fn i32v(&mut self) -> Result<i32, String> {
+    /// Steps over `n` bytes with a seek instead of a read — this is the whole
+    /// point of the rewrite: the embedded face image never needs to enter memory.
+    fn skip(&mut self, n: u64) -> Result<(), CardError> {
+        if n > self.remaining {
+            return Err(CardError::Malformed("truncated card".into()));
+        }
+        self.r
+            .seek(SeekFrom::Current(n as i64))
+            .map_err(|e| CardError::Io(e.to_string()))?;
+        self.remaining -= n;
+        Ok(())
+    }
+    fn i32v(&mut self) -> Result<i32, CardError> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn i64v(&mut self) -> Result<i64, String> {
+    fn i64v(&mut self) -> Result<i64, CardError> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
     /// .NET `BinaryReader.ReadString`: 7-bit encoded length prefix, then UTF-8.
-    fn string(&mut self) -> Result<String, String> {
+    fn string(&mut self) -> Result<String, CardError> {
         let mut n: usize = 0;
         let mut shift = 0;
         loop {
@@ -178,10 +217,10 @@ impl<'a> Cur<'a> {
             }
             shift += 7;
             if shift > 28 {
-                return Err("bad 7-bit length prefix".into());
+                return Err(CardError::Malformed("bad 7-bit length prefix".into()));
             }
         }
-        Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
+        Ok(String::from_utf8_lossy(&self.take(n)?).into_owned())
     }
 }
 
@@ -205,10 +244,17 @@ pub fn read_card(path: &Path) -> Result<CardMeta, CardError> {
     read_card_from(&mut f)
 }
 
-// TEMPORARY: this is the ORIGINAL slurping body, only generalised to `R: Read +
-// Seek` so it compiles against the new signature. It exists to prove the byte-
-// count test actually fails against the defect before the streaming rewrite
-// below replaces it — see PERF-REPORT.md for the reading it produced.
+/// Streaming twin of `read_card`: takes an already-positioned `Read + Seek`
+/// instead of a path, so a test can drive it from an in-memory `Cursor` and so
+/// `read_card` itself is a thin "open the file, delegate" wrapper.
+///
+/// This is where the 2.1x-slower-than-the-C#-tool defect lived: the appended
+/// block used to be slurped whole with `read_to_end` before a single byte of it
+/// was parsed. The embedded face image and everything after the `Parameter`
+/// block — most of a real card's appended bytes — is now stepped over with a
+/// `seek` instead of a `read`, and the `Parameter` block itself is reached by
+/// seeking straight to its offset, exactly like the lazy `BinaryReader` the C#
+/// tool uses.
 pub fn read_card_from<R: Read + Seek>(r: &mut R) -> Result<CardMeta, CardError> {
     let (off, len) = payload_span(r)
         .map_err(|e| CardError::Io(e.to_string()))?
@@ -218,13 +264,10 @@ pub fn read_card_from<R: Read + Seek>(r: &mut R) -> Result<CardMeta, CardError> 
     }
     r.seek(SeekFrom::Start(off))
         .map_err(|e| CardError::Io(e.to_string()))?;
-    let mut buf = Vec::new();
-    r.read_to_end(&mut buf)
-        .map_err(|e| CardError::Io(e.to_string()))?;
 
-    let mut c = Cur { b: &buf, p: 0 };
-    c.i32v().map_err(CardError::Malformed)?; // ProductNo
-    let marker = c.string().map_err(CardError::Malformed)?;
+    let mut c = StreamCur { r, remaining: len };
+    c.i32v()?; // ProductNo
+    let marker = c.string()?;
 
     // Only when the marker is not recognised do we consider this might be a
     // KStudio scene card: its payload has no ProductNo and opens directly with a
@@ -234,8 +277,10 @@ pub fn read_card_from<R: Read + Seek>(r: &mut R) -> Result<CardMeta, CardError> 
     let (game, route) = match classify_marker(&marker) {
         Some(gr) => gr,
         None => {
-            let mut probe = Cur { b: &buf, p: 0 };
-            if let Ok(s) = probe.string() {
+            c.r.seek(SeekFrom::Start(off))
+                .map_err(|e| CardError::Io(e.to_string()))?;
+            c.remaining = len;
+            if let Ok(s) = c.string() {
                 if looks_like_version(&s) {
                     return Err(CardError::Scene(s));
                 }
@@ -255,19 +300,25 @@ pub fn read_card_from<R: Read + Seek>(r: &mut R) -> Result<CardMeta, CardError> 
         return Ok(meta);
     }
 
-    c.string().map_err(CardError::Malformed)?; // loadVersion
-    let face = c.i32v().map_err(CardError::Malformed)?;
+    c.string()?; // loadVersion
+    let face = c.i32v()?;
     if face > 0 {
-        c.take(face as usize).map_err(CardError::Malformed)?;
+        // The face image is the bulk of a real card's appended bytes and is
+        // never inspected — stepping over it with a seek is the single biggest
+        // part of what makes this streaming instead of a smaller slurp.
+        c.skip(face as u64)?;
     }
-    let n = c.i32v().map_err(CardError::Malformed)?;
+    let n = c.i32v()?;
     if n < 0 {
         return Err(CardError::Malformed("negative block table length".into()));
     }
-    let table_bytes = c.take(n as usize).map_err(CardError::Malformed)?;
-    let table = decode(table_bytes).map_err(CardError::Malformed)?;
-    c.i64v().map_err(CardError::Malformed)?; // total
-    let blocks_at = c.p;
+    let table_bytes = c.take(n as usize)?;
+    let table = decode(&table_bytes).map_err(CardError::Malformed)?;
+    c.i64v()?; // total
+    // Absolute file offset of the first byte of the block region, derived from
+    // how much of the payload has been consumed so far — equivalent to asking
+    // the reader for its current position, but free of an extra syscall.
+    let blocks_at = off + (len - c.remaining);
 
     // Everything above this line is structure: the marker, the block table, the
     // total. It has all parsed, which means the card IS a card and the marker has
@@ -280,7 +331,7 @@ pub fn read_card_from<R: Read + Seek>(r: &mut R) -> Result<CardMeta, CardError> 
     //
     // `Malformed` stays for structure that is genuinely broken — a truncated
     // payload, an undecodable block table, a Parameter entry whose `pos`/`size`
-    // do not describe a region of this buffer.
+    // do not describe a region of the payload.
     let parameter_entry = table
         .get("lstInfo")
         .and_then(|v| v.as_array())
@@ -299,12 +350,20 @@ pub fn read_card_from<R: Read + Seek>(r: &mut R) -> Result<CardMeta, CardError> 
         // lying about its own layout, not an unreadable field.
         return Err(CardError::Malformed("Parameter block has no pos/size".into()));
     }
-    let start = blocks_at.saturating_add(pos as usize);
-    let end = start.saturating_add(size as usize);
-    let slice = buf
-        .get(start..end)
-        .ok_or_else(|| CardError::Malformed("Parameter block runs past end of card".into()))?;
-    let Ok(p) = decode(slice) else {
+    // Bounds-checked against the payload length `payload_span` measured off the
+    // real file, BEFORE any seek or allocation: a hostile pos/size can shift the
+    // read but can never grow it past what the file actually contains, and never
+    // triggers an allocation larger than the payload itself.
+    let start = blocks_at.saturating_add(pos as u64);
+    let end = start.saturating_add(size as u64);
+    let payload_end = off + len;
+    if end > payload_end {
+        return Err(CardError::Malformed("Parameter block runs past end of card".into()));
+    }
+    c.r.seek(SeekFrom::Start(start))
+        .map_err(|e| CardError::Io(e.to_string()))?;
+    let block_bytes = read_exact_mapped(c.r, size as usize)?;
+    let Ok(p) = decode(&block_bytes) else {
         return Ok(meta); // the block is there but unreadable — sex stays Unknown
     };
 
