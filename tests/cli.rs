@@ -123,5 +123,13 @@ fn a_nonexistent_root_is_reported_on_stderr_and_exits_nonzero() {
     let err = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(err.contains(&missing.display().to_string()), "{err}");
 
+    // The banner is a promise that a scan is starting, so it must not be printed
+    // when no scan will happen: the root check now runs first and stdout stays
+    // empty. Asserting this is what makes the sentence above true rather than
+    // aspirational.
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(!text.contains("koikatsu-hamster 0.1.0"), "banner printed anyway: {text}");
+    assert!(text.is_empty(), "nothing at all belongs on stdout: {text}");
+
     let _ = std::fs::remove_dir_all(&root);
 }

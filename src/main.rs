@@ -240,17 +240,19 @@ fn main() {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let _ = writeln!(out, "{VERSION_BANNER}");
 
     let root = args
         .root
         .clone()
         .unwrap_or_else(|| std::env::current_dir().expect("current directory"));
+    // The root is checked BEFORE the banner is printed, so a typoed --root
+    // produces a diagnostic and nothing else. A banner is a promise that a scan
+    // is starting; printing one and then bailing out says the run happened.
     if let Err(e) = check_root(&root) {
-        let _ = out.flush();
         eprintln!("{e}");
         std::process::exit(1);
     }
+    let _ = writeln!(out, "{VERSION_BANNER}");
     let rep = run(&root, args.dry_run, args.search.as_deref(), &mut out);
     print_summary(&rep, &mut out);
     if args.dry_run {
