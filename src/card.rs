@@ -87,6 +87,13 @@ impl CardMeta {
 
 #[derive(Debug)]
 pub enum CardError {
+    /// The file could not be read at all — permission denied, a Windows sharing
+    /// violation (the card is open in the character maker), a network share
+    /// hiccup, a file that vanished between the walk and the read. Deliberately
+    /// NOT `NotCard`: an unreadable card is an error the user must see, not a
+    /// texture. Laundering these into "non-card image" is the silent-drop class
+    /// this rewrite exists to kill.
+    Io(String),
     /// Not a PNG, or a PNG with nothing appended.
     NotCard,
     /// A KStudio scene card, carrying the version string found in place of a marker.
@@ -100,6 +107,7 @@ pub enum CardError {
 impl CardError {
     pub fn reason(&self) -> String {
         match self {
+            CardError::Io(e) => format!("could not be read: {e}"),
             CardError::NotCard => "not a card (nothing appended after IEND)".into(),
             CardError::Scene(v) => format!("KStudio scene card (version {v})"),
             CardError::Unrecognized(m) => format!("unrecognized marker {m:?}"),
@@ -182,17 +190,25 @@ impl<'a> Cur<'a> {
 /// matching real card bytes, which was true in practice but not guaranteed by
 /// the structure of the format. A failure to even read the marker (truncated or
 /// unreadable payload) is still `Malformed`, never silently treated as a scene.
+///
+/// The file is opened exactly once: `payload_span` locates the appended block on
+/// the same handle the payload is then read from, so there is no window in which
+/// the path could come to mean a different file. Every I/O failure along the way
+/// becomes `CardError::Io` — distinct from `NotCard`, which is reserved for a
+/// file whose *contents* say it is an ordinary image.
 pub fn read_card(path: &Path) -> Result<CardMeta, CardError> {
-    let (off, len) = payload_span(path).ok_or(CardError::NotCard)?;
+    let mut f = fs::File::open(path).map_err(|e| CardError::Io(e.to_string()))?;
+    let (off, len) = payload_span(&mut f)
+        .map_err(|e| CardError::Io(e.to_string()))?
+        .ok_or(CardError::NotCard)?;
     if len == 0 {
         return Err(CardError::NotCard);
     }
-    let mut f = fs::File::open(path).map_err(|e| CardError::Malformed(e.to_string()))?;
     f.seek(SeekFrom::Start(off))
-        .map_err(|e| CardError::Malformed(e.to_string()))?;
+        .map_err(|e| CardError::Io(e.to_string()))?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)
-        .map_err(|e| CardError::Malformed(e.to_string()))?;
+        .map_err(|e| CardError::Io(e.to_string()))?;
 
     let mut c = Cur { b: &buf, p: 0 };
     c.i32v().map_err(CardError::Malformed)?; // ProductNo
@@ -397,6 +413,49 @@ mod tests {
         let d = Dir::new();
         let p = file(&d, "a.png", b"not a png");
         assert!(matches!(read_card(&p), Err(CardError::NotCard)));
+    }
+
+    /// The other half of the same distinction: a file that cannot be READ is an
+    /// error, never "not a card". The two tests above pin the contents-based
+    /// verdict; this one pins that an I/O failure is not laundered into it.
+    ///
+    /// A directory standing where a `.png` should be is the portable way to get a
+    /// real I/O failure without depending on permissions or elevation: Windows
+    /// refuses to open a directory as a file, and Unix opens it but fails the
+    /// first read with `EISDIR`. Either way the failure comes from the operating
+    /// system, not from the bytes.
+    #[test]
+    fn a_path_that_cannot_be_read_is_an_io_error_not_a_non_card() {
+        let d = Dir::new();
+        let p = d.path().join("a.png");
+        std::fs::create_dir(&p).unwrap();
+        match read_card(&p) {
+            Err(CardError::Io(_)) => {}
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    /// The routine real-world case: the card is open in the character maker, so
+    /// Windows refuses a second handle with a sharing violation. Before the fix
+    /// this counted as "non-card image" and the run still exited 0, calling a
+    /// character card a texture.
+    #[cfg(windows)]
+    #[test]
+    fn a_card_locked_by_another_process_is_an_io_error_not_a_non_card() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = Dir::new();
+        let p = file(&d, "locked.png", &fixture::card("【KoiKatuChara】", 1, "a", "b"));
+        // share_mode(0) = FILE_SHARE_NONE: deny every other opener, which is
+        // exactly the state a card sitting open in the character maker is in.
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&p)
+            .expect("take an exclusive handle");
+        match read_card(&p) {
+            Err(CardError::Io(_)) => {}
+            other => panic!("expected Io, got {other:?}"),
+        }
     }
 
     #[test]

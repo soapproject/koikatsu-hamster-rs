@@ -103,6 +103,9 @@ pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write
                 let _ = writeln!(out, "Skipped {}: {}", file.display(), e.reason());
                 continue;
             }
+            // Io and Malformed. An unreadable file is reported and counted as an
+            // error — never folded into `non_cards`, which would call a card the
+            // user cannot open a texture and still exit 0.
             Err(e) => {
                 rep.errors += 1;
                 let _ = writeln!(out, "Failed to handle {}: {}", file.display(), e.reason());
@@ -392,6 +395,33 @@ mod tests {
         run(r, false, Some("asuna"), &mut out);
         assert!(r.join("Koikatu/Female/asuna/hit.png").exists());
         assert!(r.join("Koikatu/Female/miss.png").exists());
+    }
+
+    /// A card that cannot be opened must be reported and counted as an error, not
+    /// silently added to `non_cards`. `share_mode(0)` reproduces the routine real
+    /// case — the card is open in the character maker — and before the fix this
+    /// run reported `non_cards: 1`, `errors: 0`, printed nothing about the file
+    /// and exited 0.
+    #[cfg(windows)]
+    #[test]
+    fn a_card_that_cannot_be_read_is_reported_as_an_error_not_counted_as_a_texture() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = Dir::new();
+        let r = d.path();
+        write(r, "locked.png", &fixture::card("【KoiKatuChara】", 1, "a", "b"));
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(r.join("locked.png"))
+            .expect("take an exclusive handle");
+
+        let mut out = Vec::new();
+        let rep = run(r, false, None, &mut out);
+
+        assert_eq!(rep.errors, 1, "an unreadable card is an error");
+        assert_eq!(rep.non_cards, 0, "and must not be laundered into non-card images");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("locked.png"), "the file must be named: {text}");
     }
 
     #[test]

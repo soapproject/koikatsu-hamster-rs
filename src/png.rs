@@ -1,8 +1,7 @@
 //! Locate the block Koikatsu appends after a PNG's first IEND chunk.
 
-use std::fs;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::fs::File;
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
 
 const SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -13,29 +12,60 @@ const SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 /// what makes this reliable: the signature can occur inside compressed IDAT data,
 /// and a scanner has to get buffer-boundary bookkeeping right. Stepping over each
 /// chunk by its declared length has neither problem.
-pub fn payload_span(path: &Path) -> Option<(u64, u64)> {
-    let mut f = fs::File::open(path).ok()?;
-    let file_len = f.metadata().ok()?.len();
+///
+/// Three outcomes, kept apart on purpose:
+/// * `Ok(Some(span))` — this is a PNG and here is what follows its IEND.
+/// * `Ok(None)` — this file's *contents* say it is not a PNG (wrong signature,
+///   too short, a chunk length running past EOF). The caller reports it as "not
+///   a card".
+/// * `Err(e)` — the file could not be **read**: a permission denial, a Windows
+///   sharing violation because the card is open in the character maker, a
+///   network share that blinked, a file deleted between the walk and this read.
+///   Folding these into `Ok(None)` is what made the tool call an unreadable card
+///   a texture and still exit 0 — the exact silent drop this rewrite exists to
+///   kill.
+///
+/// Takes an already-open handle so the caller can go on to read the payload from
+/// the same one, instead of opening the same path twice and getting a different
+/// file the second time.
+pub fn payload_span(f: &mut File) -> io::Result<Option<(u64, u64)>> {
+    let file_len = f.metadata()?.len();
+    f.seek(SeekFrom::Start(0))?;
     let mut sig = [0u8; 8];
-    f.read_exact(&mut sig).ok()?;
+    if !read_or_eof(f, &mut sig)? {
+        return Ok(None); // shorter than a PNG signature
+    }
     if sig != SIG {
-        return None;
+        return Ok(None);
     }
     let mut off: u64 = 8;
     loop {
         let mut hdr = [0u8; 8];
-        f.read_exact(&mut hdr).ok()?;
+        if !read_or_eof(f, &mut hdr)? {
+            return Ok(None); // chunk chain ends mid-header
+        }
         let ln = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
         let is_iend = &hdr[4..8] == b"IEND";
         let next = off + 8 + ln + 4; // length + type + data + crc
         if next > file_len {
-            return None; // malformed: chunk runs past EOF
+            return Ok(None); // malformed: chunk runs past EOF
         }
         if is_iend {
-            return Some((next, file_len - next));
+            return Ok(Some((next, file_len - next)));
         }
-        f.seek(SeekFrom::Start(next)).ok()?;
+        f.seek(SeekFrom::Start(next))?;
         off = next;
+    }
+}
+
+/// `Ok(true)` when `buf` was filled, `Ok(false)` when the file ended first —
+/// which is a statement about the file's contents, not a read failure. Any other
+/// error is a genuine I/O failure and is propagated.
+fn read_or_eof(f: &mut File, buf: &mut [u8]) -> io::Result<bool> {
+    match f.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -69,10 +99,19 @@ mod tests {
         (d, p)
     }
 
+    /// Opens the path and asks for the span, asserting that opening and reading
+    /// it raised no I/O error — every test in this module is about file
+    /// *contents*, so an `Err` here would be a broken test environment, not a
+    /// result to fold into `None`.
+    fn span(p: &std::path::Path) -> Option<(u64, u64)> {
+        let mut f = std::fs::File::open(p).expect("open");
+        payload_span(&mut f).expect("no I/O error")
+    }
+
     #[test]
     fn finds_the_payload_after_iend() {
         let (_d, p) = write(&png(&[7; 10], b"PAYLOAD"));
-        let (off, len) = payload_span(&p).expect("span");
+        let (off, len) = span(&p).expect("span");
         assert_eq!(len, 7);
         let bytes = std::fs::read(&p).unwrap();
         assert_eq!(&bytes[off as usize..], b"PAYLOAD");
@@ -81,7 +120,7 @@ mod tests {
     #[test]
     fn a_plain_image_has_a_zero_length_payload() {
         let (_d, p) = write(&png(&[7; 10], b""));
-        assert_eq!(payload_span(&p).map(|(_, l)| l), Some(0));
+        assert_eq!(span(&p).map(|(_, l)| l), Some(0));
     }
 
     /// hamster scanned for the 8 IEND bytes through a 4096-byte sliding window and
@@ -100,7 +139,7 @@ mod tests {
     fn iend_straddling_a_4096_byte_boundary_is_still_found() {
         for pad in 4000..4200 {
             let (_d, p) = write(&png(&vec![7u8; pad], b"PAYLOAD"));
-            let (off, len) = payload_span(&p).unwrap_or_else(|| panic!("pad {pad}"));
+            let (off, len) = span(&p).unwrap_or_else(|| panic!("pad {pad}"));
             assert_eq!(len, 7, "pad {pad}");
             let bytes = std::fs::read(&p).unwrap();
             assert_eq!(&bytes[off as usize..], b"PAYLOAD", "pad {pad}");
@@ -114,13 +153,13 @@ mod tests {
         let mut filler = vec![0u8; 20];
         filler.extend_from_slice(&[0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82]);
         let (_d, p) = write(&png(&filler, b"PAYLOAD"));
-        assert_eq!(payload_span(&p).map(|(_, l)| l), Some(7));
+        assert_eq!(span(&p).map(|(_, l)| l), Some(7));
     }
 
     #[test]
     fn a_non_png_is_none() {
         let (_d, p) = write(b"not a png at all");
-        assert_eq!(payload_span(&p), None);
+        assert_eq!(span(&p), None);
     }
 
     #[test]
@@ -130,6 +169,6 @@ mod tests {
         // at offset 8..12) with something enormous.
         bytes[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
         let (_d, p) = write(&bytes);
-        assert_eq!(payload_span(&p), None);
+        assert_eq!(span(&p), None);
     }
 }
