@@ -1,8 +1,9 @@
 # koikatsu-hamster-rs
 
 A Rust rewrite of [koikatsu-hamster](https://github.com/soapproject/koikatsu-hamster) — it sorts
-Koikatsu (and related IllGames/Illusion titles) card PNGs into `[Game]/[Female|Male|Coordinate]`
-folders by reading the card data appended after the PNG's `IEND` chunk.
+Koikatsu (and related IllGames/Illusion titles) card PNGs into
+`[Game]/[Female|Male|Coordinate|Character]` folders by reading the card data appended after the
+PNG's `IEND` chunk.
 
 See [the design document](docs/superpowers/specs/2026-07-29-card-organizer-design.md) for why
 this exists and how it decides.
@@ -23,7 +24,8 @@ koikatsu-hamster [--root <dir>] [--dry-run] [search term]
 
 The run ends with a summary of what moved and what was left alone. It pauses for a keypress only
 when stdin is a terminal, so it can be called from a script; the exit code is 1 if any file
-errored, otherwise 0.
+errored, otherwise 0. A `--root` that doesn't exist or can't be read is reported on stderr and
+exits non-zero before anything is scanned, rather than printing an empty summary and exiting 0.
 
 ## Why a rewrite
 

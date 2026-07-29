@@ -43,17 +43,34 @@ fn organises_a_tree_prints_a_banner_and_exits_zero() {
     assert!(root.join("Koikatu/Male/x.png").exists(), "{text}");
     assert!(text.contains("--- summary ---"), "{text}");
 
-    // Second run: the output folders are skipped, so nothing is left to do.
+    // Second run: the output folders are skipped, so nothing is left to do. Proving
+    // that takes more than an absent "Move file:" line — a crashed second run (a
+    // panic, a `check_root` regression, anything that dies before the move loop)
+    // would produce empty stdout and pass that check trivially. Assert the process
+    // actually succeeded, that both files first run put in place are still exactly
+    // there, and that no `(1)`-suffixed duplicate appeared beside them — which is
+    // what a second run WOULD produce if the output folders stopped being skipped
+    // and it tried to re-move them.
     let out2 = Command::new(EXE).arg("--root").arg(&root).output().expect("run");
     let text2 = String::from_utf8_lossy(&out2.stdout).to_string();
+    assert!(out2.status.success(), "exit {:?}\n{text2}", out2.status.code());
     assert!(!text2.contains("Move file:"), "{text2}");
+    assert!(root.join("Koikatu/Female/god.png").exists(), "{text2}");
+    assert!(root.join("Koikatu/Male/x.png").exists(), "{text2}");
+    assert!(!root.join("Koikatu/Female/god(1).png").exists(), "{text2}");
+    assert!(!root.join("Koikatu/Male/x(1).png").exists(), "{text2}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// hamster's unconditional ReadKey throws under a redirected stdin. `Command`
-/// gives the child a null stdin, so reaching this assertion at all proves the
-/// process exits on its own.
+/// `Command::output()` gives the child a null stdin, and reading a *closed* stdin
+/// returns EOF immediately rather than blocking — so reaching the assertions below
+/// only proves the process didn't hang, not that the terminal gate actually fired.
+/// If `std::io::stdin().is_terminal()` regressed to always-true, the binary would
+/// still print its "press Enter to exit" prompt, read EOF from the closed stdin,
+/// and exit normally without hanging — every assertion here would still pass. The
+/// prompt-line assertion below is what actually exercises the gate: it fails if
+/// the prompt is printed even though stdin isn't a terminal.
 #[test]
 fn a_malformed_card_exits_one_without_waiting_for_input() {
     let root = temp_root("err");
@@ -64,6 +81,8 @@ fn a_malformed_card_exits_one_without_waiting_for_input() {
     let out = Command::new(EXE).arg("--root").arg(&root).output().expect("run");
     assert_eq!(out.status.code(), Some(1));
     assert!(root.join("broken.png").exists());
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(!text.contains("All jobs done"), "{text}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
