@@ -1,3 +1,6 @@
+mod card;
+#[cfg(test)]
+mod fixture;
 mod msgpack;
 mod png;
 #[cfg(test)]
