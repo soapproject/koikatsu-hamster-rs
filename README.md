@@ -4,8 +4,26 @@ A Rust rewrite of [koikatsu-hamster](https://github.com/soapproject/koikatsu-ham
 Koikatsu (and related IllGames/Illusion titles) card PNGs into `[Game]/[Female|Male|Coordinate]`
 folders by reading the card data appended after the PNG's `IEND` chunk.
 
-**Status: design complete, implementation not started.** See
-[the design document](docs/superpowers/specs/2026-07-29-card-organizer-design.md).
+See [the design document](docs/superpowers/specs/2026-07-29-card-organizer-design.md) for why
+this exists and how it decides.
+
+## Usage
+
+Drop `koikatsu-hamster.exe` in the folder where you keep your cards and double-click it, exactly
+like the C# version. It walks that folder and everything under it, and files each card into
+`[Game]/[Female|Male|Coordinate|Character]`.
+
+```
+koikatsu-hamster [--root <dir>] [--dry-run] [search term]
+
+  --root <dir>   directory to organise (default: the current directory)
+  --dry-run      report what would move, change nothing
+  search term    cards whose full name contains it are filed one level deeper
+```
+
+The run ends with a summary of what moved and what was left alone. It pauses for a keypress only
+when stdin is a terminal, so it can be called from a script; the exit code is 1 if any file
+errored, otherwise 0.
 
 ## Why a rewrite
 
