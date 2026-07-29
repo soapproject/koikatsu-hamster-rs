@@ -56,6 +56,7 @@ impl Args {
                     if a.search.is_some() {
                         return Err("only one search term is accepted".into());
                     }
+                    check_search_term(other)?;
                     a.search = Some(other.to_string());
                 }
             }
@@ -63,6 +64,31 @@ impl Args {
         }
         Ok(a)
     }
+}
+
+/// The search term is joined onto the destination as one more folder level, so
+/// whatever it says, `Path::join` obeys: a term containing a separator files
+/// matched cards into a subtree of the user's choosing, `..` walks them out of
+/// the destination entirely, and an absolute term (or a bare Windows drive
+/// prefix like `C:`) discards the destination and replaces it. A term is meant
+/// to be a name to sort by, so it is checked once here, at the edge, and the
+/// rest of the program never has to ask.
+fn check_search_term(term: &str) -> Result<(), String> {
+    if term.contains('/') || term.contains('\\') {
+        return Err(format!("search term {term:?} must not contain a path separator"));
+    }
+    if term.contains("..") {
+        return Err(format!("search term {term:?} must not contain \"..\""));
+    }
+    // Catches what those two cannot spell out — a root, a `.`, or a drive
+    // prefix, each of which changes what `join` means.
+    if Path::new(term)
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(format!("search term {term:?} must be a plain folder name"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -290,6 +316,27 @@ mod tests {
     #[test]
     fn an_unknown_flag_is_an_error() {
         assert!(args(&["--recursive"]).is_err());
+    }
+
+    /// The term becomes a path component, so `Path::join` would let it relocate
+    /// every matched card: a separator files them into a subtree of the term's
+    /// choosing, `..` walks them out of the destination, and an absolute term or
+    /// a drive prefix replaces the destination outright. All rejected at parse
+    /// time, which `main` turns into a usage error and exit 2.
+    #[test]
+    fn a_search_term_that_could_relocate_cards_is_rejected_at_parse_time() {
+        for bad in ["a/b", "a\\b", "..", "../elsewhere", "/absolute", "."] {
+            assert!(args(&[bad]).is_err(), "{bad:?} should be rejected");
+        }
+        #[cfg(windows)]
+        assert!(args(&["C:"]).is_err(), "a bare drive prefix replaces the destination");
+
+        assert_eq!(args(&["asuna"]).unwrap().search.as_deref(), Some("asuna"));
+        assert_eq!(
+            args(&["姫野"]).unwrap().search.as_deref(),
+            Some("姫野"),
+            "a name is a plain folder name whatever alphabet it is in"
+        );
     }
 
     fn write(root: &Path, rel: &str, bytes: &[u8]) {

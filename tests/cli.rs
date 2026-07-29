@@ -87,6 +87,19 @@ fn a_malformed_card_exits_one_without_waiting_for_input() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A search term is joined onto the destination as a folder level, so one
+/// containing a separator or `..` would relocate every matched card. It is a
+/// usage error, and this is the layer that can see the process really exits 2
+/// and prints the usage text rather than scanning anything.
+#[test]
+fn a_search_term_containing_a_path_separator_exits_two_with_usage() {
+    let out = Command::new(EXE).arg("../elsewhere").output().expect("run");
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(err.contains("usage:"), "{err}");
+    assert!(err.contains("elsewhere"), "the rejected term is named: {err}");
+}
+
 #[test]
 fn an_unknown_flag_exits_two_with_usage() {
     let out = Command::new(EXE).arg("--recursive").output().expect("run");
