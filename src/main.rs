@@ -198,12 +198,48 @@ pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write
         if let Err(e) = std::fs::rename(&file, &target) {
             rep.errors += 1;
             let _ = writeln!(out, "Failed to handle {}: {}", file.display(), e);
+            // Leave no empty destination folder behind as evidence of a move
+            // that did not happen — the next run would otherwise find a
+            // `Koikatu/Female` that never received a card.
+            prune_empty_dirs(&dir, root);
             continue;
         }
         let _ = writeln!(out, "Move file: {} to {}", shown, target.display());
         rep.record(rel);
     }
     rep
+}
+
+/// Remove `dir` and then its parents, up to but never including `root`, stopping
+/// at the first one that is not empty.
+///
+/// `fs::remove_dir` refuses a directory that has anything in it, so this can only
+/// ever undo directories this run created a moment ago and can never take a file
+/// with it. Every failure is ignored on purpose: this is tidying after an error
+/// that has already been reported, and failing to tidy is not worth a second
+/// message.
+fn prune_empty_dirs(dir: &Path, root: &Path) {
+    let mut d = dir;
+    while d != root && d.starts_with(root) && std::fs::remove_dir(d).is_ok() {
+        match d.parent() {
+            Some(p) => d = p,
+            None => return,
+        }
+    }
+}
+
+/// The directory to scan: `--root` when given, otherwise the working directory.
+///
+/// `current_dir()` genuinely can fail — the working directory was deleted, or is
+/// not accessible — and `expect()`ing it aborts with a panic message and exit
+/// code 101, outside the documented contract of 0, 1 and 2 entirely. Taking the
+/// result as an argument keeps that decision testable without touching the
+/// process-wide working directory, which other tests running in parallel rely on.
+fn resolve_root(arg: Option<PathBuf>, cwd: std::io::Result<PathBuf>) -> Result<PathBuf, String> {
+    match arg {
+        Some(r) => Ok(r),
+        None => cwd.map_err(|e| format!("cannot determine the current directory: {e}")),
+    }
 }
 
 /// Checked separately from the run loop so a typoed or unreadable `--root`
@@ -247,10 +283,13 @@ fn main() {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
-    let root = args
-        .root
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().expect("current directory"));
+    let root = match resolve_root(args.root.clone(), std::env::current_dir()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
     // The root is checked BEFORE the banner is printed, so a typoed --root
     // produces a diagnostic and nothing else. A banner is a promise that a scan
     // is starting; printing one and then bailing out says the run happened.
@@ -319,6 +358,46 @@ mod tests {
         let missing = d.path().join("does-not-exist");
         let err = check_root(&missing).unwrap_err();
         assert!(err.contains(&missing.display().to_string()), "{err}");
+    }
+
+    /// With no `--root`, the working directory is the root — and asking for it
+    /// can fail (it was deleted, or is not accessible). That was an `expect()`,
+    /// which aborts with exit code 101 and a backtrace, outside the program's
+    /// documented 0/1/2 contract. It is now a sentence and a usage exit.
+    #[test]
+    fn an_unresolvable_working_directory_is_a_reported_error_not_a_panic() {
+        let gone = || std::io::Error::new(std::io::ErrorKind::NotFound, "no such directory");
+        let err = resolve_root(None, Err(gone())).unwrap_err();
+        assert!(err.contains("current directory"), "{err}");
+
+        // An explicit --root is used as given; the working directory is never
+        // consulted, so its state cannot sink the run.
+        assert_eq!(
+            resolve_root(Some(PathBuf::from("/tmp/x")), Err(gone())).unwrap(),
+            PathBuf::from("/tmp/x")
+        );
+    }
+
+    /// The tidy-up after a failed move must never be able to delete anything but
+    /// the empty folders the run just created, and must stop at the scan root.
+    #[test]
+    fn pruning_empty_directories_stops_at_the_root_and_at_anything_not_empty() {
+        let d = Dir::new();
+        let r = d.path();
+        let deep = r.join("Koikatu").join("Female");
+        std::fs::create_dir_all(&deep).unwrap();
+        prune_empty_dirs(&deep, r);
+        assert!(!deep.exists(), "the empty destination is gone");
+        assert!(!r.join("Koikatu").exists(), "and so is the empty level above it");
+        assert!(r.exists(), "but never the scan root");
+
+        let kept = r.join("HoneyCome").join("Female");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(r.join("HoneyCome").join("keep.png"), b"1").unwrap();
+        prune_empty_dirs(&kept, r);
+        assert!(!kept.exists(), "the empty leaf goes");
+        assert!(r.join("HoneyCome").exists(), "a level holding a file stays");
+        assert!(r.join("HoneyCome").join("keep.png").exists());
     }
 
     #[test]
