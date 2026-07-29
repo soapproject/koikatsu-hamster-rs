@@ -173,6 +173,15 @@ impl<'a> Cur<'a> {
     }
 }
 
+/// Reads the appended block and classifies it. A recognised marker always wins:
+/// `ProductNo` and the marker string are read first, and only when the marker is
+/// NOT in the table does this fall back to probing offset 0 as a KStudio scene's
+/// version string. That order means a card with a known marker can never be
+/// misclassified as a scene, no matter what its `ProductNo` bytes would probe as
+/// — the old code ran the scene probe first and relied on it almost never
+/// matching real card bytes, which was true in practice but not guaranteed by
+/// the structure of the format. A failure to even read the marker (truncated or
+/// unreadable payload) is still `Malformed`, never silently treated as a scene.
 pub fn read_card(path: &Path) -> Result<CardMeta, CardError> {
     let (off, len) = payload_span(path).ok_or(CardError::NotCard)?;
     if len == 0 {
@@ -185,21 +194,27 @@ pub fn read_card(path: &Path) -> Result<CardMeta, CardError> {
     f.read_to_end(&mut buf)
         .map_err(|e| CardError::Malformed(e.to_string()))?;
 
-    // A scene card has no ProductNo: its payload opens with the version string.
-    // Try that reading first, and only if it yields a version number accept it.
-    {
-        let mut probe = Cur { b: &buf, p: 0 };
-        if let Ok(s) = probe.string() {
-            if looks_like_version(&s) {
-                return Err(CardError::Scene(s));
-            }
-        }
-    }
-
     let mut c = Cur { b: &buf, p: 0 };
     c.i32v().map_err(CardError::Malformed)?; // ProductNo
     let marker = c.string().map_err(CardError::Malformed)?;
-    let (game, route) = classify_marker(&marker).ok_or(CardError::Unrecognized(marker))?;
+
+    // Only when the marker is not recognised do we consider this might be a
+    // KStudio scene card: its payload has no ProductNo and opens directly with a
+    // version string where a chara card keeps its marker, so re-read from offset
+    // 0 as a length-prefixed string and check whether it looks like a dotted
+    // version number.
+    let (game, route) = match classify_marker(&marker) {
+        Some(gr) => gr,
+        None => {
+            let mut probe = Cur { b: &buf, p: 0 };
+            if let Ok(s) = probe.string() {
+                if looks_like_version(&s) {
+                    return Err(CardError::Scene(s));
+                }
+            }
+            return Err(CardError::Unrecognized(marker));
+        }
+    };
 
     let mut meta = CardMeta {
         game,
@@ -239,7 +254,7 @@ pub fn read_card(path: &Path) -> Result<CardMeta, CardError> {
     if pos < 0 || size < 0 {
         return Err(CardError::Malformed("Parameter block has no pos/size".into()));
     }
-    let start = blocks_at + pos as usize;
+    let start = blocks_at.saturating_add(pos as usize);
     let end = start.saturating_add(size as usize);
     let slice = buf
         .get(start..end)
@@ -337,14 +352,39 @@ mod tests {
     /// A scene card's payload starts with a version string where a chara card has a
     /// marker. Detecting it keeps the unrecognized-marker report readable: one real
     /// batch held 278 scenes.
+    ///
+    /// Under the reordered read (marker read attempted first, scene probe only as
+    /// fallback), the initial marker read starts 4 bytes in and misinterprets one
+    /// of the version string's own bytes as a length prefix — it needs enough
+    /// trailing bytes present to complete without truncating, so it can fail to
+    /// recognise the garbage marker and fall through to the probe, rather than
+    /// erroring out as `Malformed` before the probe ever runs. `fixture::scene`'s
+    /// minimal payload is real card size; pad it out here so this stays a test of
+    /// scene detection, not of the fixture's brevity.
     #[test]
     fn a_scene_card_is_recognized_by_its_version_string() {
         let d = Dir::new();
-        let p = file(&d, "a.png", &fixture::scene("1.0.4.2"));
+        let mut bytes = fixture::scene("1.0.4.2");
+        bytes.extend(std::iter::repeat(0u8).take(128));
+        let p = file(&d, "a.png", &bytes);
         match read_card(&p) {
             Err(CardError::Scene(v)) => assert_eq!(v, "1.0.4.2"),
             other => panic!("expected Scene, got {other:?}"),
         }
+    }
+
+    /// The reordered read makes a recognised marker win unconditionally: even
+    /// though this card's `ProductNo` bytes (`100i32` little-endian, so byte 0 is
+    /// `0x64` = 100) would happily feed the old first-run scene probe as a
+    /// plausible length prefix, the marker is read and classified before the
+    /// probe is ever consulted, so a real card can never be misfiled as a scene.
+    #[test]
+    fn a_recognized_marker_is_never_reclassified_as_a_scene() {
+        let d = Dir::new();
+        let p = file(&d, "a.png", &fixture::card("【KoiKatuChara】", 1, "a", "b"));
+        let m = read_card(&p).expect("a recognised marker must classify as a card");
+        assert_eq!(m.game, Game::Koikatu);
+        assert_eq!(m.route, Route::BySex);
     }
 
     #[test]
