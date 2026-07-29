@@ -126,9 +126,23 @@ failure this program was written to end.
 top level, and treating it as one is the original bug.
 
 Deeper directories that happen to share a game's name are not output folders and are not
-skipped. Idempotence is achieved by the exclusion alone; destination-equals-source checking was
-considered and rejected because re-parsing an already-filed collection (~160k cards) on every
-run is too slow to be worth the extra safety net.
+skipped — a `pack/Koikatu/Female/` inside a downloaded archive is somebody else's layout, and
+its cards are consolidated into this root's own folders like any others.
+
+The exclusion carries idempotence on its own for every ordinary run. What was rejected is
+*pre-emptive* destination-equals-source checking — re-parsing an already-filed collection
+(~160k cards) on every run to find out whether each card is where it belongs is too slow to be
+worth it. A card that reaches the move step is checked at that point, after its parse has
+already happened, and skipped if its destination is the folder it is already in; that costs
+nothing and stops the one failure it guards against, a card renamed onto its own successor
+(`x.png` → `x(1).png`) and again on the next run.
+
+One case that check cannot catch, accepted: run inside an already-organised `…/Koikatu`
+folder — that folder is then the root, so a card in `Female/` computes a destination of
+`…/Koikatu/Koikatu/Female`, which is not its parent. The collection is re-filed one level
+deeper. Nothing is lost, duplicated or suffixed, and the second run is a no-op because
+`Koikatu` is a first-level component again. Catching it would need an "ends with
+`{Game}/{leaf}`" rule, which is exactly the consolidation behaviour of the paragraph above.
 
 ### Per-file decision order
 
