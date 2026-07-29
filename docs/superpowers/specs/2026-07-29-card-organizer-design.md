@@ -128,8 +128,27 @@ run is too slow to be worth the extra safety net.
 | marker not in the table, and the payload read from offset 0 as a length-prefixed string matches `^\d+(\.\d+)+$` (e.g. `1.0.4.2`) | KStudio scene card: count, leave in place |
 | marker not in the table, and not a version string | **print file name and the marker**, leave in place |
 | in table, not a Character card | move to `{Game}/{CardType}` |
-| in table, Character | read `sex` from the `Parameter` block → `{Game}/{Female,Male}`; unreadable → `{Game}/Unknown` |
-| parse fails part-way | **print file name and the error**, leave in place, continue |
+| in table, Character | read `sex` from the `Parameter` block → `{Game}/{Female,Male}`; undeterminable → `{Game}/Unknown` |
+| structure broken part-way through | **print file name and the error**, leave in place, continue |
+| the file cannot be read at all | **print file name and the I/O error**, leave in place, continue |
+
+**Undeterminable `sex` versus a broken card.** The marker has already told us which
+game's folder the card belongs in, so a card whose structure parses but whose `sex`
+cannot be established is *placeable* and goes to `{Game}/Unknown`. That covers all
+three ways it can be undeterminable: no `Parameter` entry in `lstInfo`, a `Parameter`
+block that does not decode, and a missing or non-integer `sex` field. None of them is
+a reason to leave a card where it lies, and none of them may fail the run's exit code
+— one odd card in a 2000-card batch must not make the whole run report failure.
+
+`malformed` is reserved for a card whose *structure* is broken: a truncated payload,
+an undecodable block table, or a `Parameter` entry whose `pos`/`size` do not describe
+a region of the payload. Those are reported per file and counted as errors.
+
+**Unreadable is not "not a card".** A file that cannot be read — permission denied, a
+Windows sharing violation because the card is open in the character maker, a network
+share that blinked, a file deleted between the walk and the read — is reported and
+counted as an error. It is never folded into the silent `non-card image` count: doing
+so is how the C# version came to call a real card a texture and still exit 0.
 
 Recognizing scene cards is what keeps the "unrecognized marker" line meaningful: one real batch
 held 278 of them, which would otherwise bury a genuine miss in noise. They are counted, never

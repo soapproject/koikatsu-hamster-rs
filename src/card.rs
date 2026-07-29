@@ -100,7 +100,11 @@ pub enum CardError {
     Scene(String),
     /// A card of some kind, but its marker is not in the table. Never guessed.
     Unrecognized(String),
-    /// Structurally broken past the marker.
+    /// The card's *structure* is broken past the marker: a truncated payload, an
+    /// undecodable block table, a `Parameter` entry whose `pos`/`size` do not
+    /// describe a region of the payload. Deliberately NOT used when the card
+    /// parses but its `sex` cannot be determined — the marker has already told us
+    /// the game, so such a card is placeable and is filed under `{Game}/Unknown`.
     Malformed(String),
 }
 
@@ -257,17 +261,34 @@ pub fn read_card(path: &Path) -> Result<CardMeta, CardError> {
     c.i64v().map_err(CardError::Malformed)?; // total
     let blocks_at = c.p;
 
-    let info = table
+    // Everything above this line is structure: the marker, the block table, the
+    // total. It has all parsed, which means the card IS a card and the marker has
+    // already told us which game's folder it belongs in. What is left is reading
+    // `sex` out of the Parameter block, and that can fail without the card being
+    // broken at all — an unfamiliar Parameter layout, a future block this decoder
+    // does not understand, a card that simply has no Parameter entry. Those file
+    // the card under `{Game}/Unknown`: a placeable card must never be left where
+    // it lies, and must never fail the whole run's exit code.
+    //
+    // `Malformed` stays for structure that is genuinely broken — a truncated
+    // payload, an undecodable block table, a Parameter entry whose `pos`/`size`
+    // do not describe a region of this buffer.
+    let parameter_entry = table
         .get("lstInfo")
         .and_then(|v| v.as_array())
         .and_then(|list| {
             list.iter()
                 .find(|it| it.get("name").and_then(|v| v.as_str()) == Some("Parameter"))
-        })
-        .ok_or_else(|| CardError::Malformed("no Parameter block in the table".into()))?;
+        });
+    let Some(info) = parameter_entry else {
+        return Ok(meta); // no Parameter entry at all — sex stays Unknown
+    };
+
     let pos = info.get("pos").and_then(|v| v.as_i64()).unwrap_or(-1);
     let size = info.get("size").and_then(|v| v.as_i64()).unwrap_or(-1);
     if pos < 0 || size < 0 {
+        // The entry exists but does not locate anything: that is the table
+        // lying about its own layout, not an unreadable field.
         return Err(CardError::Malformed("Parameter block has no pos/size".into()));
     }
     let start = blocks_at.saturating_add(pos as usize);
@@ -275,7 +296,9 @@ pub fn read_card(path: &Path) -> Result<CardMeta, CardError> {
     let slice = buf
         .get(start..end)
         .ok_or_else(|| CardError::Malformed("Parameter block runs past end of card".into()))?;
-    let p = decode(slice).map_err(CardError::Malformed)?;
+    let Ok(p) = decode(slice) else {
+        return Ok(meta); // the block is there but unreadable — sex stays Unknown
+    };
 
     meta.sex = match p.get("sex").and_then(|v| v.as_i64()) {
         Some(0) => Sex::Male,
@@ -477,5 +500,84 @@ mod tests {
         bytes[at..at + 3].copy_from_slice(b"zzz");
         let p = file(&d, "a.png", &bytes);
         assert_eq!(read_card(&p).unwrap().sex, Sex::Unknown);
+    }
+
+    /// The third way `sex` can be undeterminable: the key is there but the value
+    /// is not an integer. `0xC0` is msgpack nil and occupies the same single byte
+    /// as the `1` it replaces, so the block still decodes cleanly.
+    #[test]
+    fn a_non_integer_sex_field_yields_unknown_rather_than_an_error() {
+        let d = Dir::new();
+        let mut bytes = fixture::card("【KoiKatuChara】", 1, "a", "b");
+        let at = bytes.windows(3).position(|w| w == b"sex").expect("key present");
+        bytes[at + 3] = 0xC0; // nil where the sex integer was
+        let p = file(&d, "a.png", &bytes);
+        let m = read_card(&p).expect("a card whose sex is unreadable is still a card");
+        assert_eq!(m.sex, Sex::Unknown);
+        assert_eq!(m.game, Game::Koikatu);
+    }
+
+    /// A character card with no `Parameter` entry in `lstInfo` at all. The marker
+    /// already said which game this is, so it is placeable — it belongs in
+    /// `{Game}/Unknown`, not left where it lies with the run's exit code failed
+    /// over it. Renaming the entry's `name` value is what makes the lookup miss
+    /// without disturbing a single offset in the card.
+    #[test]
+    fn a_card_with_no_parameter_entry_is_filed_under_unknown_rather_than_failed() {
+        let d = Dir::new();
+        let mut bytes = fixture::card("【KoiKatuChara】", 1, "a", "b");
+        let at = bytes
+            .windows(9)
+            .position(|w| w == b"Parameter")
+            .expect("the block table names the Parameter entry");
+        bytes[at..at + 9].copy_from_slice(b"Xarameter");
+        let p = file(&d, "a.png", &bytes);
+        let m = read_card(&p).expect("still a card: the marker placed it");
+        assert_eq!(m.game, Game::Koikatu);
+        assert_eq!(m.route, Route::BySex);
+        assert_eq!(m.sex, Sex::Unknown);
+    }
+
+    /// The `Parameter` entry points at a real region of the payload, but the
+    /// bytes there are not msgpack this decoder understands — a future or damaged
+    /// block. `0xC1` is the one byte msgpack reserves and never assigns, so it is
+    /// a decode failure and nothing else. Same verdict: `{Game}/Unknown`.
+    #[test]
+    fn an_undecodable_parameter_block_is_filed_under_unknown_rather_than_failed() {
+        let d = Dir::new();
+        let mut bytes = fixture::card("【KoiKatuChara】", 1, "a", "b");
+        // The Parameter block is a 4-pair fixmap whose first key is "version";
+        // the block table's own entry map starts 0x84 0xA4 "name", so this
+        // 9-byte window matches the Parameter block and nothing else.
+        let head = [0x84, 0xA7, b'v', b'e', b'r', b's', b'i', b'o', b'n'];
+        let at = bytes
+            .windows(9)
+            .position(|w| w == head)
+            .expect("the Parameter block starts with a fixmap and a version key");
+        assert!(
+            bytes.windows(9).filter(|w| *w == head).count() == 1,
+            "the marker byte this test corrupts must be unambiguous"
+        );
+        bytes[at] = 0xC1; // never a valid msgpack type byte
+        let p = file(&d, "a.png", &bytes);
+        let m = read_card(&p).expect("still a card: the marker placed it");
+        assert_eq!(m.game, Game::Koikatu);
+        assert_eq!(m.sex, Sex::Unknown);
+    }
+
+    /// The other side of the line: a card whose *structure* is broken is still an
+    /// error, reported and left alone. Truncating the payload cuts into the region
+    /// the block table claims the Parameter block occupies, so `pos`/`size` no
+    /// longer describe anything in the buffer.
+    #[test]
+    fn a_structurally_broken_card_is_still_an_error_not_filed_under_unknown() {
+        let d = Dir::new();
+        let mut bytes = fixture::card("【KoiKatuChara】", 1, "a", "b");
+        bytes.truncate(bytes.len() - 4);
+        let p = file(&d, "a.png", &bytes);
+        match read_card(&p) {
+            Err(CardError::Malformed(_)) => {}
+            other => panic!("expected Malformed, got {other:?}"),
+        }
     }
 }

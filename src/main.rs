@@ -500,6 +500,27 @@ mod tests {
         assert!(r.join("Koikatu/Female/dup(1).png").exists());
     }
 
+    /// A character card whose `sex` cannot be read is still placeable — the
+    /// marker named the game — so it is filed under `{Game}/Unknown` and the run
+    /// still exits 0. Before the fix a missing `Parameter` entry was `Malformed`:
+    /// the card was left where it lay and the whole run's exit code failed over
+    /// it, which is how one odd card made a 2000-card run look like a failure.
+    #[test]
+    fn a_character_card_whose_sex_cannot_be_read_is_filed_under_unknown_not_failed() {
+        let d = Dir::new();
+        let r = d.path();
+        let mut bytes = fixture::card("【KoiKatuChara】", 1, "a", "b");
+        let at = bytes.windows(9).position(|w| w == b"Parameter").expect("entry");
+        bytes[at..at + 9].copy_from_slice(b"Xarameter");
+        write(r, "odd.png", &bytes);
+
+        let mut out = Vec::new();
+        let rep = run(r, false, None, &mut out);
+
+        assert_eq!(rep.errors, 0, "a placeable card must not fail the run");
+        assert!(r.join("Koikatu").join("Unknown").join("odd.png").exists());
+    }
+
     /// End to end: a card whose file name is not valid UTF-8 must arrive at its
     /// destination under exactly the name it had. Before the fix the move target
     /// was built from `to_string_lossy`, so the card was renamed to a row of
