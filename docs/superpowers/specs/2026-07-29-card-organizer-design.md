@@ -108,9 +108,19 @@ branches could not be verified against a real card.
 
 ### Exclusion rule
 
-Skip only directories **directly under `<root>`** whose name is **exactly** a game folder name
+Skip only directories **directly under `<root>`** whose name is a game folder name
 (`Koikatu`, `KoikatsuSunshine`, `HoneyCome`, `SVC`, `Aicomi`, `EmotionCreators`). Comparison is
-per path component, never substring.
+of the whole path component against the whole name — never a substring — and is
+**case-insensitive**.
+
+Case-insensitive because the target filesystem is: on Windows, the folder this program
+created as `Koikatu` is the same folder Explorer will happily show as `koikatu`, and a
+case-sensitive comparison would fail to recognise the program's own output and re-file it into
+itself. It is also the safe direction for the error that remains: on a case-sensitive filesystem
+a user folder named `svc/` or `aicomi/` directly under the root is skipped, so the cards under
+it are never scanned — they stay exactly where the user put them, untouched. The opposite error
+loses the idempotence guarantee and starts moving already-filed cards around, which is the
+failure this program was written to end.
 
 `Unknown` is not in that set. It is an enum sentinel, not a folder this program creates at the
 top level, and treating it as one is the original bug.
