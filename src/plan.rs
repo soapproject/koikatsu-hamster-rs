@@ -40,6 +40,26 @@ pub fn is_in_dest_folder(root: &Path, file: &Path) -> bool {
     DEST_FOLDERS.iter().any(|d| d.eq_ignore_ascii_case(&first))
 }
 
+/// True when `file` already sits directly in `dest_dir` — the move would be a
+/// rename onto itself.
+///
+/// The exclusion rule is supposed to make this impossible, but it is a rule about
+/// *folder names*, and there is more than one way for it to miss: the two lists
+/// in `card.rs` drifting apart when a game is added, or a root chosen inside an
+/// already-organised tree. When it misses, `free_name` finds the card itself
+/// occupying the destination name, hands back `x(1).png`, and the card is renamed
+/// onto its own successor — run again and it is `x(1)(1).png`.
+///
+/// The spec rejected destination-equals-source checking on the cost of re-parsing
+/// an already-filed collection. This check happens *after* the parse that has
+/// already occurred, so that cost is not in play: it is one path comparison.
+/// Comparing `Path`s component-wise is exact here because both sides descend from
+/// the same `root` value — `walk` builds every candidate by joining onto it, and
+/// `destination_dir` joins onto it too, so there is no spelling to normalise.
+pub fn is_already_filed(dest_dir: &Path, file: &Path) -> bool {
+    file.parent() == Some(dest_dir)
+}
+
 /// `dir/file_name`, or `dir/stem(1).ext` etc. when that is taken.
 ///
 /// The name is an `OsStr` from end to end. A card extracted from a Shift-JIS
@@ -214,6 +234,18 @@ mod tests {
     #[test]
     fn a_path_outside_the_root_is_not_excluded() {
         assert!(!is_in_dest_folder(Path::new("/r"), Path::new("/other/Koikatu/x.png")));
+    }
+
+    /// The last line of defence against a card being renamed onto itself. Only
+    /// the file's own directory counts: a card one level deeper, or in a
+    /// different leaf, still has a move to make.
+    #[test]
+    fn a_card_already_sitting_in_its_destination_is_recognised_as_filed() {
+        let dest = Path::new("/r").join("Koikatu").join("Female");
+        assert!(is_already_filed(&dest, &dest.join("x.png")));
+        assert!(!is_already_filed(&dest, &dest.join("sub").join("x.png")));
+        assert!(!is_already_filed(&dest, &Path::new("/r").join("Koikatu").join("Male").join("x.png")));
+        assert!(!is_already_filed(&dest, &Path::new("/r").join("x.png")));
     }
 
     #[test]

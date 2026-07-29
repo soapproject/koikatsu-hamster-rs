@@ -9,7 +9,7 @@ mod fixture;
 mod tempdir;
 
 use crate::card::{read_card, CardError};
-use crate::plan::{destination_dir, free_name};
+use crate::plan::{destination_dir, free_name, is_already_filed};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -72,6 +72,10 @@ pub struct Report {
     pub scenes: u64,
     pub non_cards: u64,
     pub unrecognized: u64,
+    /// Cards found already sitting in the folder they would be moved to. Counted
+    /// rather than passed over in silence: a file the run touched and did nothing
+    /// about is exactly what the summary must not hide.
+    pub already_filed: u64,
     pub errors: u64,
 }
 
@@ -114,6 +118,19 @@ pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write
         };
 
         let dir = destination_dir(root, &meta, search);
+
+        // Never move a card onto itself. The exclusion rule is meant to make this
+        // unreachable, but it is a rule about folder names and can miss — the two
+        // lists in card.rs drifting apart, or a root chosen inside an already
+        // organised tree. When it misses, free_name sees the card occupying its
+        // own destination name and returns x(1).png; the next run makes that
+        // x(1)(1).png. The parse has already happened by this point, so the check
+        // the spec rejected on re-parsing cost is here just one path comparison.
+        if is_already_filed(&dir, &file) {
+            rep.already_filed += 1;
+            continue;
+        }
+
         // The name stays an OsStr all the way to `rename`: a card out of a
         // Shift-JIS archive can have a file name that is not valid UTF-8, and
         // moving it under its `to_string_lossy` spelling would rename it to a
@@ -181,6 +198,7 @@ fn print_summary(rep: &Report, out: &mut dyn Write) {
     let _ = writeln!(out, "  left alone  {:<26} {:>5}", "scene cards", rep.scenes);
     let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "non-card images", rep.non_cards);
     let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "unrecognized markers", rep.unrecognized);
+    let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "already in place", rep.already_filed);
     let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "errors", rep.errors);
 }
 
@@ -374,6 +392,99 @@ mod tests {
         let rep = run(r, false, None, &mut out2);
         assert_eq!(rep.moved.iter().map(|(_, n)| n).sum::<u64>(), 0);
         assert_eq!(rep.non_cards, 0);
+    }
+
+    /// Every `.png` under `root`, relative and slash-separated — including the
+    /// output folders `walk` skips, because this is about what is on disk.
+    fn all_pngs(root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().map(|x| x == "png").unwrap_or(false) {
+                    out.push(
+                        p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Double-clicking the exe inside an already-organised `…/Koikatu` folder
+    /// makes that folder the scan root, so `Female/` is not a first-level
+    /// component and the exclusion rule does not fire — the collection is walked
+    /// and parsed again. Whatever else that does, the one thing that must never
+    /// happen is a card being renamed onto its own successor: `girl.png` becoming
+    /// `girl(1).png`, then `girl(1)(1).png`, growing a suffix on every run while
+    /// the summary claims a successful move. Two runs from inside the game folder
+    /// and the card is still a single file that never gained a counter.
+    #[test]
+    fn a_double_click_inside_an_organised_game_folder_never_renames_a_card_onto_itself() {
+        let d = Dir::new();
+        let root = d.path().join("Koikatu"); // the organised game folder itself
+        write(&root, "Female/girl.png", &fixture::card("【KoiKatuChara】", 1, "a", "b"));
+
+        let mut out = Vec::new();
+        let rep1 = run(&root, false, None, &mut out);
+        let after_first = all_pngs(&root);
+        let mut out2 = Vec::new();
+        let rep2 = run(&root, false, None, &mut out2);
+        let after_second = all_pngs(&root);
+
+        assert_eq!(rep1.errors, 0);
+        assert_eq!(rep2.errors, 0);
+        assert_eq!(after_first.len(), 1, "no copy was made: {after_first:?}");
+        assert_eq!(after_second.len(), 1, "and none the second time: {after_second:?}");
+        assert_eq!(after_first, after_second, "the second run is a no-op");
+        for p in &after_second {
+            assert!(
+                p.ends_with("/girl.png"),
+                "a card must never be renamed onto its own successor: {p}"
+            );
+        }
+        // Documented, not endorsed: with the game folder itself as the root, the
+        // card's destination is `<root>/Koikatu/Female`, which is NOT its parent
+        // `<root>/Female`, so the destination-equals-parent guard does not fire
+        // and the card is re-filed one level deeper. The second run then skips it
+        // (the nested `Koikatu/` IS a first-level output folder), so the layout is
+        // stable and nothing is lost or duplicated — but a user who double-clicks
+        // inside a game folder does get a `Koikatu/Koikatu/Female`.
+        assert_eq!(after_second, ["Koikatu/Female/girl.png"]);
+    }
+
+    /// The self-move guard's verdict, asserted directly, on a card sitting in the
+    /// folder it would be moved to. `run` cannot be made to reach the guard while
+    /// `Game::folder()` and `DEST_FOLDERS` agree — `walk` excludes the whole
+    /// first-level `Koikatu/` before the parse — which is exactly why the guard
+    /// exists: it is the backstop for the day those two lists drift apart. The
+    /// `run` half below pins the other side of that: with the lists in agreement,
+    /// the card is left strictly alone.
+    #[test]
+    fn a_card_already_in_its_destination_is_counted_and_not_moved() {
+        let d = Dir::new();
+        let r = d.path();
+        let dest = r.join("Koikatu").join("Female");
+        std::fs::create_dir_all(&dest).unwrap();
+        let card = dest.join("girl.png");
+        std::fs::write(&card, fixture::card("【KoiKatuChara】", 1, "a", "b")).unwrap();
+
+        let meta = read_card(&card).expect("card");
+        let dir = destination_dir(r, &meta, None);
+        assert!(
+            is_already_filed(&dir, &card),
+            "the card is already where it belongs, so nothing may be renamed"
+        );
+
+        let mut out = Vec::new();
+        let rep = run(r, false, None, &mut out);
+        assert!(card.exists(), "still there under its own name");
+        assert!(!dest.join("girl(1).png").exists(), "never renamed onto its successor");
+        assert_eq!(rep.moved.iter().map(|(_, n)| n).sum::<u64>(), 0);
     }
 
     #[test]
