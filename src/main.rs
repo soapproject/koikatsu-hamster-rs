@@ -122,12 +122,66 @@ impl Report {
     }
 }
 
+/// Parse every candidate, in parallel, returning results in the SAME order as
+/// `files` so the run's output is byte-identical to a serial parse.
+///
+/// Parsing is pure: it opens a file, reads a few hundred bytes and returns a
+/// verdict. Nothing it does is visible to another card's parse, so the only
+/// thing the ordering guarantees have to survive is the report — and that is
+/// rebuilt from the indexed results by the serial move loop below.
+fn parse_all(files: &[PathBuf]) -> Vec<Result<card::CardMeta, CardError>> {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(16)
+        .min(files.len().max(1));
+    if threads <= 1 || files.len() < 2 {
+        return files.iter().map(|f| read_card(f)).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut chunks: Vec<Vec<(usize, Result<card::CardMeta, CardError>)>> =
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    let next = &next;
+                    s.spawn(move || {
+                        let mut mine = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= files.len() {
+                                break;
+                            }
+                            mine.push((i, read_card(&files[i])));
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        });
+    let mut out: Vec<Option<Result<card::CardMeta, CardError>>> =
+        (0..files.len()).map(|_| None).collect();
+    for chunk in chunks.drain(..) {
+        for (i, r) in chunk {
+            out[i] = Some(r);
+        }
+    }
+    out.into_iter()
+        .map(|o| o.unwrap_or(Err(CardError::Io("not parsed".into()))))
+        .collect()
+}
+
 pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write) -> Report {
     let mut rep = Report::default();
     let scan = walk::candidates(root);
     rep.symlinked = scan.symlinked_pngs;
-    for file in scan.files {
-        let meta = match read_card(&file) {
+    let parsed = parse_all(&scan.files);
+    // Destinations this run has already created. `create_dir_all` costs a failing
+    // create plus a stat every time it is called — ~50 us on Windows — and a run
+    // calls it once per card into a handful of folders.
+    let mut made: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for (file, parsed) in scan.files.into_iter().zip(parsed) {
+        let meta = match parsed {
             Ok(m) => m,
             Err(CardError::NotCard) => {
                 rep.non_cards += 1;
@@ -193,10 +247,18 @@ pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write
             continue;
         }
 
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            rep.errors += 1;
-            let _ = writeln!(out, "Failed to handle {}: {}", file.display(), e);
-            continue;
+        // `create_dir_all` on a directory that already exists still costs a
+        // failing create plus a stat — ~50 us here, once per card, into a handful
+        // of folders. `made` remembers the ones this run has created; a folder
+        // deleted underneath us mid-run would be missed, and `rename` reports
+        // that as the error it is rather than the run pretending it moved.
+        if !made.contains(&dir) {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                rep.errors += 1;
+                let _ = writeln!(out, "Failed to handle {}: {}", file.display(), e);
+                continue;
+            }
+            made.insert(dir.clone());
         }
         let target = free_name(&dir, name);
         if let Err(e) = std::fs::rename(&file, &target) {
@@ -206,6 +268,9 @@ pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write
             // that did not happen — the next run would otherwise find a
             // `Koikatu/Female` that never received a card.
             prune_empty_dirs(&dir, root);
+            // Whatever pruning removed is no longer on disk, so the next card
+            // bound for it must create it again rather than trust `made`.
+            made.remove(&dir);
             continue;
         }
         let _ = writeln!(out, "Move file: {} to {}", shown, target.display());
@@ -284,8 +349,9 @@ fn main() {
         }
     };
 
+    // One line per card goes through here; unbuffered, each is its own write.
     let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+    let mut out = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
 
     let root = match resolve_root(args.root.clone(), std::env::current_dir()) {
         Ok(r) => r,
