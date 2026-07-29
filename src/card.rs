@@ -323,6 +323,61 @@ mod tests {
         p
     }
 
+    /// `Game::folder()` and `DEST_FOLDERS` are two hand-maintained copies of the
+    /// same six names. They agree today; the day a seventh game is added to one
+    /// and forgotten in the other, the exclusion rule stops covering that game's
+    /// output folder and the scan starts re-walking its own output — with the
+    /// consequence the self-move guard exists to catch.
+    ///
+    /// The `match` below is exhaustive and deliberately has no wildcard arm: a new
+    /// `Game` variant makes this test fail to COMPILE until it is handled here,
+    /// and the two count assertions then fail until `DEST_FOLDERS` gains it too.
+    #[test]
+    fn every_game_folder_is_listed_in_dest_folders_and_vice_versa() {
+        const ALL: [Game; 6] = [
+            Game::Koikatu,
+            Game::KoikatsuSunshine,
+            Game::HoneyCome,
+            Game::Svc,
+            Game::Aicomi,
+            Game::EmotionCreators,
+        ];
+
+        for g in ALL {
+            let expected = match g {
+                Game::Koikatu => "Koikatu",
+                Game::KoikatsuSunshine => "KoikatsuSunshine",
+                Game::HoneyCome => "HoneyCome",
+                Game::Svc => "SVC",
+                Game::Aicomi => "Aicomi",
+                Game::EmotionCreators => "EmotionCreators",
+            };
+            assert_eq!(g.folder(), expected);
+            assert!(
+                DEST_FOLDERS.contains(&expected),
+                "{expected} is a game folder but is not in DEST_FOLDERS, so the \
+                 exclusion rule would not skip it"
+            );
+        }
+
+        for d in DEST_FOLDERS {
+            assert!(
+                ALL.iter().any(|g| g.folder() == d),
+                "{d} is in DEST_FOLDERS but no Game produces it"
+            );
+        }
+        assert_eq!(
+            ALL.len(),
+            DEST_FOLDERS.len(),
+            "one list gained an entry the other did not"
+        );
+        assert!(
+            !DEST_FOLDERS.contains(&"Unknown"),
+            "Unknown is a Sex value, never a top-level folder — treating it as one \
+             is the original C# bug"
+        );
+    }
+
     #[test]
     fn reads_a_koikatu_female_character_card() {
         let d = Dir::new();
