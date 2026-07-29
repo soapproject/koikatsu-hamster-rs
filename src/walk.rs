@@ -190,44 +190,114 @@ mod tests {
         Some(result)
     }
 
-    /// Pins the Critical fix: a directory symlink (or, on Windows, a
-    /// junction) pointing back at an ancestor must not send the scan into an
-    /// infinite loop. `entry.file_type()` never follows the link, so
+    /// Pins the Critical fix: a directory junction (Windows) or symlink
+    /// (elsewhere) pointing back at an ancestor must not send the scan into
+    /// an infinite loop. `entry.file_type()` never follows the link, so
     /// `is_symlink()` is true for the link itself without ever resolving the
     /// target — exactly the cheap check `candidates` needs in order to
     /// refuse to descend, with no visited-set and no `canonicalize` calls.
     ///
-    /// Creating a directory symlink on Windows normally needs elevation or
-    /// Developer Mode. If that fails here, the test prints a note and
-    /// returns rather than failing the whole suite — the guard in
-    /// `candidates` is unconditional either way, this just leaves the cycle
-    /// itself unverified on such a machine.
+    /// On Windows this uses `mklink /J`, a directory **junction**, not
+    /// `symlink_dir` — a plain symlink needs elevation or Developer Mode,
+    /// which routinely is not available, but a junction needs neither and
+    /// still trips `FILE_ATTRIBUTE_REPARSE_POINT` alongside
+    /// `FILE_ATTRIBUTE_DIRECTORY`, which is exactly the shape the guard has
+    /// to handle: `FileType::is_symlink` on Windows is true for
+    /// `IO_REPARSE_TAG_MOUNT_POINT` (junctions) as well as
+    /// `IO_REPARSE_TAG_SYMLINK` — unlike e.g. Python's `os.path.islink`,
+    /// which reports `False` for a junction.
+    ///
+    /// Without the `is_symlink` guard this test would not merely fail an
+    /// assertion, it would hang: `sub/loop_back_to_root` resolves back to
+    /// `root`, whose own listing contains `sub` again, so the walk would
+    /// keep re-descending through the junction forever, appending a fresh
+    /// duplicate of `a.png`/`b.png` to the result and a fresh nested
+    /// `.../loop_back_to_root/sub/loop_back_to_root/...` path onto the stack
+    /// on every pass — unbounded, not merely slow.
     #[test]
-    fn a_directory_symlink_pointing_at_an_ancestor_does_not_loop_forever() {
+    fn a_directory_junction_pointing_at_an_ancestor_does_not_loop_forever() {
         let d = Dir::new();
         touch(d.path(), "a.png");
         touch(d.path(), "sub/b.png");
         let link = d.path().join("sub").join("loop_back_to_root");
 
-        #[cfg(windows)]
-        let made_link = std::os::windows::fs::symlink_dir(d.path(), &link).is_ok();
-        #[cfg(unix)]
-        let made_link = std::os::unix::fs::symlink(d.path(), &link).is_ok();
-        #[cfg(not(any(windows, unix)))]
-        let made_link = false;
-
-        if !made_link {
+        if !make_ancestor_link(&link, d.path()) {
             eprintln!(
-                "note: skipping a_directory_symlink_pointing_at_an_ancestor_does_not_loop_forever \
-                 — could not create a directory symlink in this environment (on Windows this \
-                 needs elevation or Developer Mode); the reparse-point guard in `candidates` is \
-                 still in place, just unverified by this run"
+                "note: skipping a_directory_junction_pointing_at_an_ancestor_does_not_loop_forever \
+                 — could not create a directory junction/symlink in this environment; the \
+                 reparse-point guard in `candidates` is still in place, just unverified by this run"
             );
             return;
         }
+        eprintln!(
+            "a_directory_junction_pointing_at_an_ancestor_does_not_loop_forever: link created, \
+             calling candidates() through the cycle for real"
+        );
 
-        assert_eq!(names(d.path()), ["a.png", "sub/b.png"]);
+        // The call returning at all (rather than hanging) is half of what
+        // this test is pinning down; the other half is that the result is
+        // still exactly the two real files, each counted once, with nothing
+        // pulled in by walking through the junction.
+        let result = names(d.path());
+
+        remove_ancestor_link(&link);
+        assert!(
+            d.path().exists() && d.path().join("a.png").exists(),
+            "cleanup must remove only the junction, not the tree it points at"
+        );
+
+        assert_eq!(result, ["a.png", "sub/b.png"]);
     }
+
+    /// Create `link` pointing at `target` (an ancestor of `link`), using
+    /// whichever mechanism the platform allows without elevation. Returns
+    /// `false` if creation failed for any reason (missing tool, permissions,
+    /// unsupported platform) — the caller treats that as "skip, don't fail".
+    #[cfg(windows)]
+    fn make_ancestor_link(link: &Path, target: &Path) -> bool {
+        // Directory junctions need no elevation and no Developer Mode, unlike
+        // `std::os::windows::fs::symlink_dir`. `mklink` is a `cmd.exe`
+        // builtin, not a standalone executable, so it has to be invoked
+        // through `cmd /C`.
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn make_ancestor_link(link: &Path, target: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    fn make_ancestor_link(_link: &Path, _target: &Path) -> bool {
+        false
+    }
+
+    /// Unlink `link` itself without touching what it points at.
+    ///
+    /// `std::fs::remove_dir_all` on a path containing a junction can, on
+    /// some Windows versions, follow the junction and delete through it —
+    /// exactly the wrong thing when the junction points at an ancestor.
+    /// `remove_dir` on a junction unlinks the reparse point only; the target
+    /// directory and its contents are untouched. On Unix, the link is a
+    /// symlink and is removed the same way any file entry is.
+    #[cfg(windows)]
+    fn remove_ancestor_link(link: &Path) {
+        let _ = std::fs::remove_dir(link);
+    }
+
+    #[cfg(unix)]
+    fn remove_ancestor_link(link: &Path) {
+        let _ = std::fs::remove_file(link);
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    fn remove_ancestor_link(_link: &Path) {}
 
     /// The Important fix: `candidates` must return a fully, deterministically
     /// sorted `Vec`, not just sorted within each directory. Unlike every
