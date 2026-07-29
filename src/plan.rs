@@ -1,6 +1,7 @@
 //! Where a card belongs, and which paths are this program's own output.
 
 use crate::card::{CardMeta, Route, DEST_FOLDERS};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// Where a card belongs. `search`, when the card's full name contains it, adds one
@@ -40,23 +41,66 @@ pub fn is_in_dest_folder(root: &Path, file: &Path) -> bool {
 }
 
 /// `dir/file_name`, or `dir/stem(1).ext` etc. when that is taken.
-pub fn free_name(dir: &Path, file_name: &str) -> PathBuf {
+///
+/// The name is an `OsStr` from end to end. A card extracted from a Shift-JIS
+/// archive can carry a file name that is not valid UTF-8 (the card data itself
+/// isn't guaranteed to be either — see `msgpack.rs`), and running it through
+/// `to_string_lossy` first would make a string full of U+FFFD the *actual*
+/// rename target: the file would be renamed to a mangled name and the original
+/// would be unrecoverable. Lossy conversion is for the printed line only.
+pub fn free_name(dir: &Path, file_name: &OsStr) -> PathBuf {
     let direct = dir.join(file_name);
     if !direct.exists() {
         return direct;
     }
-    let (stem, ext) = match file_name.rsplit_once('.') {
-        Some((s, e)) => (s.to_string(), format!(".{e}")),
-        None => (file_name.to_string(), String::new()),
-    };
+    let (stem, ext) = split_at_last_dot(file_name);
     let mut n = 1u32;
     loop {
-        let candidate = dir.join(format!("{stem}({n}){ext}"));
+        let mut name = stem.clone();
+        name.push(format!("({n})"));
+        name.push(&ext);
+        let candidate = dir.join(name);
         if !candidate.exists() {
             return candidate;
         }
         n += 1;
     }
+}
+
+/// Split at the LAST `.`, the dot staying with the extension; a name with no dot
+/// is all stem. This is the same split the `&str` version did with
+/// `rsplit_once('.')`, done on the platform's own encoding so no byte is lost —
+/// not `Path::extension`, whose treatment of leading and trailing dots differs.
+#[cfg(windows)]
+fn split_at_last_dot(name: &OsStr) -> (OsString, OsString) {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let w: Vec<u16> = name.encode_wide().collect();
+    match w.iter().rposition(|&c| c == '.' as u16) {
+        Some(i) => (OsString::from_wide(&w[..i]), OsString::from_wide(&w[i..])),
+        None => (name.to_os_string(), OsString::new()),
+    }
+}
+
+#[cfg(unix)]
+fn split_at_last_dot(name: &OsStr) -> (OsString, OsString) {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let b = name.as_bytes();
+    match b.iter().rposition(|&c| c == b'.') {
+        Some(i) => (
+            OsString::from_vec(b[..i].to_vec()),
+            OsString::from_vec(b[i..].to_vec()),
+        ),
+        None => (name.to_os_string(), OsString::new()),
+    }
+}
+
+/// Neither Windows nor Unix: there is no lossless way to inspect the bytes, and
+/// guessing with `to_string_lossy` is precisely the corruption this function
+/// exists to avoid. Treat the whole name as the stem — `x.png(1)` is ugly but it
+/// keeps every byte of the original.
+#[cfg(not(any(windows, unix)))]
+fn split_at_last_dot(name: &OsStr) -> (OsString, OsString) {
+    (name.to_os_string(), OsString::new())
 }
 
 #[cfg(test)]
@@ -175,22 +219,85 @@ mod tests {
     #[test]
     fn a_free_name_is_returned_unchanged_when_nothing_is_there() {
         let d = Dir::new();
-        assert_eq!(free_name(d.path(), "x.png"), d.path().join("x.png"));
+        assert_eq!(free_name(d.path(), OsStr::new("x.png")), d.path().join("x.png"));
     }
 
     #[test]
     fn a_taken_name_gains_a_counter() {
         let d = Dir::new();
         std::fs::write(d.path().join("x.png"), b"1").unwrap();
-        assert_eq!(free_name(d.path(), "x.png"), d.path().join("x(1).png"));
+        assert_eq!(free_name(d.path(), OsStr::new("x.png")), d.path().join("x(1).png"));
         std::fs::write(d.path().join("x(1).png"), b"1").unwrap();
-        assert_eq!(free_name(d.path(), "x.png"), d.path().join("x(2).png"));
+        assert_eq!(free_name(d.path(), OsStr::new("x.png")), d.path().join("x(2).png"));
     }
 
     #[test]
     fn a_name_without_an_extension_still_gets_a_counter() {
         let d = Dir::new();
         std::fs::write(d.path().join("x"), b"1").unwrap();
-        assert_eq!(free_name(d.path(), "x"), d.path().join("x(1)"));
+        assert_eq!(free_name(d.path(), OsStr::new("x")), d.path().join("x(1)"));
+    }
+
+    /// Build `<prefix>` + one byte/unit that cannot be UTF-8 + `<suffix>`, the
+    /// shape of a card name that came out of a Shift-JIS archive. On Windows that
+    /// is an unpaired surrogate (NTFS stores UTF-16 and does not require it to be
+    /// well-formed); on Unix a lone 0xFF byte.
+    #[cfg(windows)]
+    fn non_utf8_name(prefix: &str, suffix: &str) -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+        let mut w: Vec<u16> = prefix.encode_utf16().collect();
+        w.push(0xD800); // unpaired high surrogate
+        w.extend(suffix.encode_utf16());
+        OsString::from_wide(&w)
+    }
+
+    #[cfg(unix)]
+    fn non_utf8_name(prefix: &str, suffix: &str) -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        let mut b = prefix.as_bytes().to_vec();
+        b.push(0xFF); // never valid in UTF-8
+        b.extend_from_slice(suffix.as_bytes());
+        OsString::from_vec(b)
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    fn non_utf8_name(_prefix: &str, _suffix: &str) -> OsString {
+        OsString::new()
+    }
+
+    /// A name that is not valid UTF-8 must survive `free_name` byte for byte. The
+    /// `&str` version took `to_string_lossy(&name)` and joined THAT onto the
+    /// destination, so the U+FFFD replacement characters became the real target
+    /// name and the original spelling was gone for good.
+    #[test]
+    fn a_non_utf8_file_name_keeps_its_exact_bytes_through_the_collision_path() {
+        let d = Dir::new();
+        let name = non_utf8_name("card", ".png");
+        if name.is_empty() {
+            eprintln!("note: skipping — no non-UTF-8 name construction on this platform");
+            return;
+        }
+        assert!(
+            name.to_string_lossy().contains('\u{FFFD}'),
+            "the fixture must really be un-representable as UTF-8"
+        );
+
+        // Occupy the plain name so the counter path (the one that rebuilds the
+        // name from pieces, where the lossy conversion used to happen) is taken.
+        if std::fs::write(d.path().join(&name), b"1").is_err() {
+            eprintln!(
+                "note: skipping a_non_utf8_file_name_keeps_its_exact_bytes_through_the_collision_path \
+                 — this filesystem refused to create a file with a non-UTF-8 name; free_name still \
+                 takes an OsStr, just unverified by this run"
+            );
+            return;
+        }
+
+        let free = free_name(d.path(), &name);
+        assert_eq!(
+            free.file_name().expect("a file name"),
+            non_utf8_name("card", "(1).png").as_os_str(),
+            "the counter goes before the extension and every other unit is untouched"
+        );
     }
 }

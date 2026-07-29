@@ -114,7 +114,12 @@ pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write
         };
 
         let dir = destination_dir(root, &meta, search);
-        let name = file.file_name().unwrap_or_default().to_string_lossy().to_string();
+        // The name stays an OsStr all the way to `rename`: a card out of a
+        // Shift-JIS archive can have a file name that is not valid UTF-8, and
+        // moving it under its `to_string_lossy` spelling would rename it to a
+        // row of U+FFFD with no way back. `shown` is for the printed line only.
+        let name = file.file_name().unwrap_or_default();
+        let shown = name.to_string_lossy();
         let rel = dir
             .strip_prefix(root)
             .unwrap_or(&dir)
@@ -130,8 +135,8 @@ pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write
             // that would collide with EACH OTHER within the same dry run both
             // preview the same free name, because neither one's previewed move
             // ever "happens" on disk for the other to see.
-            let preview = free_name(&dir, &name);
-            let _ = writeln!(out, "Move file: {} to {}", name, preview.display());
+            let preview = free_name(&dir, name);
+            let _ = writeln!(out, "Move file: {} to {}", shown, preview.display());
             rep.record(rel);
             continue;
         }
@@ -141,13 +146,13 @@ pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write
             let _ = writeln!(out, "Failed to handle {}: {}", file.display(), e);
             continue;
         }
-        let target = free_name(&dir, &name);
+        let target = free_name(&dir, name);
         if let Err(e) = std::fs::rename(&file, &target) {
             rep.errors += 1;
             let _ = writeln!(out, "Failed to handle {}: {}", file.display(), e);
             continue;
         }
-        let _ = writeln!(out, "Move file: {} to {}", name, target.display());
+        let _ = writeln!(out, "Move file: {} to {}", shown, target.display());
         rep.record(rel);
     }
     rep
@@ -382,6 +387,53 @@ mod tests {
         run(r, false, None, &mut out);
         assert!(r.join("Koikatu/Female/dup.png").exists());
         assert!(r.join("Koikatu/Female/dup(1).png").exists());
+    }
+
+    /// End to end: a card whose file name is not valid UTF-8 must arrive at its
+    /// destination under exactly the name it had. Before the fix the move target
+    /// was built from `to_string_lossy`, so the card was renamed to a row of
+    /// U+FFFD and the original spelling was unrecoverable.
+    #[test]
+    fn a_card_with_a_non_utf8_name_is_moved_under_that_exact_name() {
+        use std::ffi::OsString;
+        let d = Dir::new();
+        let r = d.path();
+
+        #[cfg(windows)]
+        let name: OsString = {
+            use std::os::windows::ffi::OsStringExt;
+            let mut w: Vec<u16> = "card".encode_utf16().collect();
+            w.push(0xD800); // unpaired high surrogate
+            w.extend(".png".encode_utf16());
+            OsString::from_wide(&w)
+        };
+        #[cfg(unix)]
+        let name: OsString = {
+            use std::os::unix::ffi::OsStringExt;
+            let mut b = b"card".to_vec();
+            b.push(0xFF);
+            b.extend_from_slice(b".png");
+            OsString::from_vec(b)
+        };
+        #[cfg(not(any(windows, unix)))]
+        let name: OsString = OsString::new();
+
+        if name.is_empty() || std::fs::write(r.join(&name), fixture::card("【KoiKatuChara】", 1, "a", "b")).is_err() {
+            eprintln!(
+                "note: skipping a_card_with_a_non_utf8_name_is_moved_under_that_exact_name — \
+                 this platform/filesystem refused to create a file with a non-UTF-8 name"
+            );
+            return;
+        }
+
+        let mut out = Vec::new();
+        let rep = run(r, false, None, &mut out);
+
+        assert_eq!(rep.errors, 0);
+        assert!(
+            r.join("Koikatu").join("Female").join(&name).exists(),
+            "the card must land under its original name, not a lossy one"
+        );
     }
 
     #[test]
