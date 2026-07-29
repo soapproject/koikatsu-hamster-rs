@@ -792,6 +792,16 @@ mod tests {
         }
     }
 
+    /// The scene probe runs only after the marker lookup misses, so a card the table
+    /// recognizes can never be reclassified as a scene — a structural guarantee, not
+    /// a bet on 100 bytes of payload never spelling a version number.
+    #[test]
+    fn a_recognized_marker_is_never_reclassified_as_a_scene() {
+        let d = Dir::new();
+        let p = file(&d, "a.png", &fixture::card("【KoiKatuChara】", 1, "a", "b"));
+        assert!(matches!(read_card(&p), Ok(_)));
+    }
+
     #[test]
     fn a_plain_image_is_not_a_card() {
         let d = Dir::new();
@@ -1022,21 +1032,30 @@ pub fn read_card(path: &Path) -> Result<CardMeta, CardError> {
     f.read_to_end(&mut buf)
         .map_err(|e| CardError::Malformed(e.to_string()))?;
 
-    // A scene card has no ProductNo: its payload opens with the version string.
-    // Try that reading first, and only if it yields a version number accept it.
-    {
-        let mut probe = Cur { b: &buf, p: 0 };
-        if let Ok(s) = probe.string() {
-            if looks_like_version(&s) {
-                return Err(CardError::Scene(s));
-            }
-        }
-    }
-
     let mut c = Cur { b: &buf, p: 0 };
     c.i32v().map_err(CardError::Malformed)?; // ProductNo
     let marker = c.string().map_err(CardError::Malformed)?;
-    let (game, route) = classify_marker(&marker).ok_or(CardError::Unrecognized(marker))?;
+    let (game, route) = match classify_marker(&marker) {
+        Some(x) => x,
+        None => {
+            // A recognized marker always wins, so this probe runs only after the
+            // lookup misses. Probing first would read a real card's ProductNo low
+            // byte (0x64) as a 100-byte string length and ask whether 100 bytes of
+            // unrelated payload spell a version number — practically never, but
+            // nothing structural stops it, and such a misfiling is silent.
+            //
+            // A scene card has no ProductNo: its payload opens with the version
+            // string where a chara card keeps its marker, so the lookup misses here
+            // and the probe below matches.
+            let mut probe = Cur { b: &buf, p: 0 };
+            if let Ok(s) = probe.string() {
+                if looks_like_version(&s) {
+                    return Err(CardError::Scene(s));
+                }
+            }
+            return Err(CardError::Unrecognized(marker));
+        }
+    };
 
     let mut meta = CardMeta {
         game,

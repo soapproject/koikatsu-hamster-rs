@@ -125,8 +125,8 @@ run is too slow to be worth the extra safety net.
 | condition | action |
 |---|---|
 | not a PNG, or no payload after the first IEND | count only; not listed per file (there are thousands of textures) |
-| the length-prefixed string at the marker position matches `^\d+(\.\d+)+$` (e.g. `1.0.4.2`) | KStudio scene card: count, leave in place |
-| marker not in the table | **print file name and the marker**, leave in place |
+| marker not in the table, and the payload read from offset 0 as a length-prefixed string matches `^\d+(\.\d+)+$` (e.g. `1.0.4.2`) | KStudio scene card: count, leave in place |
+| marker not in the table, and not a version string | **print file name and the marker**, leave in place |
 | in table, not a Character card | move to `{Game}/{CardType}` |
 | in table, Character | read `sex` from the `Parameter` block → `{Game}/{Female,Male}`; unreadable → `{Game}/Unknown` |
 | parse fails part-way | **print file name and the error**, leave in place, continue |
@@ -134,6 +134,18 @@ run is too slow to be worth the extra safety net.
 Recognizing scene cards is what keeps the "unrecognized marker" line meaningful: one real batch
 held 278 of them, which would otherwise bury a genuine miss in noise. They are counted, never
 moved — consistent with scene handling being out of scope.
+
+**A recognized marker always wins.** The scene probe runs only after the marker lookup misses.
+Probing first would mean reading a real card's `ProductNo` low byte (`0x64`) as a 100-byte string
+length and asking whether 100 bytes of unrelated payload happen to spell a version number — it
+practically never would, but nothing structural stops it, and a card misfiled that way leaves no
+diagnostic behind. Checking the marker first makes the guarantee absolute rather than
+probabilistic. Scene cards still classify correctly: their payload opens with the version string
+where a chara card keeps its marker, so the lookup misses and the probe matches.
+
+One consequence, accepted: the marker read now happens before the probe on every file, so a
+payload too short to survive that read reports `malformed` rather than `scene`. A real scene card
+carries the whole scene blob and is never that small; only a synthetic near-empty fixture is.
 
 ### Collisions and the optional search term
 
