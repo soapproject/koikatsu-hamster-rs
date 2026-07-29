@@ -102,6 +102,9 @@ pub struct Report {
     /// rather than passed over in silence: a file the run touched and did nothing
     /// about is exactly what the summary must not hide.
     pub already_filed: u64,
+    /// `.png` files the walk refused to follow because they are symlinks or
+    /// reparse points. Same reasoning: skipped, but never silently.
+    pub symlinked: u64,
     pub errors: u64,
 }
 
@@ -117,7 +120,9 @@ impl Report {
 
 pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write) -> Report {
     let mut rep = Report::default();
-    for file in walk::candidates(root) {
+    let scan = walk::candidates(root);
+    rep.symlinked = scan.symlinked_pngs;
+    for file in scan.files {
         let meta = match read_card(&file) {
             Ok(m) => m,
             Err(CardError::NotCard) => {
@@ -225,6 +230,7 @@ fn print_summary(rep: &Report, out: &mut dyn Write) {
     let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "non-card images", rep.non_cards);
     let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "unrecognized markers", rep.unrecognized);
     let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "already in place", rep.already_filed);
+    let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "symlinked .png files", rep.symlinked);
     let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "errors", rep.errors);
 }
 
@@ -339,6 +345,38 @@ mod tests {
             Some("姫野"),
             "a name is a plain folder name whatever alphabet it is in"
         );
+    }
+
+    /// Every line the summary can carry has to actually appear in it: a count
+    /// kept in `Report` but never printed reports nothing to anybody.
+    #[test]
+    fn the_summary_prints_every_count_it_keeps() {
+        let rep = Report {
+            moved: vec![("Koikatu/Female".into(), 3)],
+            scenes: 1,
+            non_cards: 2,
+            unrecognized: 3,
+            already_filed: 4,
+            symlinked: 5,
+            errors: 6,
+        };
+        let mut out = Vec::new();
+        print_summary(&rep, &mut out);
+        let text = String::from_utf8(out).unwrap();
+        for expected in [
+            "Koikatu/Female",
+            "scene cards",
+            "non-card images",
+            "unrecognized markers",
+            "already in place",
+            "symlinked .png files",
+            "errors",
+        ] {
+            assert!(text.contains(expected), "{expected} missing from:\n{text}");
+        }
+        for n in ["1", "2", "3", "4", "5", "6"] {
+            assert!(text.contains(n), "count {n} missing from:\n{text}");
+        }
     }
 
     fn write(root: &Path, rel: &str, bytes: &[u8]) {

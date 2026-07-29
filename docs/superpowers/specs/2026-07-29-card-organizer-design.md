@@ -214,11 +214,19 @@ Per-file move lines keep hamster's format (`Move file: X to Y`), followed by a s
   left alone  scene cards                278
               non-card images           1790
               unrecognized markers         0
+              already in place             0
+              symlinked .png files         0
               errors                       0
 ```
 
 Unrecognized markers and errors have already been printed per file; the summary exists so the
 counts do not require scrolling back.
+
+`already in place` and `symlinked .png files` are the two ways a card-shaped file can be
+skipped without being an error: one already sits in the folder it would be moved to, the other
+is a symlink or reparse point the walk refuses to follow. Both are counted rather than passed
+over in silence — a file the run met and did nothing about is exactly what a summary must not
+hide, and hiding it is the defect this rewrite exists to end.
 
 ## Testing
 

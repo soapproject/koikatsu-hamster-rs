@@ -3,6 +3,18 @@
 use crate::plan::is_in_dest_folder;
 use std::path::{Path, PathBuf};
 
+/// What a scan of `root` turned up.
+#[derive(Debug, Default)]
+pub struct Scan {
+    /// Candidate files, in sorted order.
+    pub files: Vec<PathBuf>,
+    /// `.png` entries that were skipped because they are symlinks or, on
+    /// Windows, some other reparse point. Skipping them is deliberate; leaving
+    /// them out of every counter is not — a file in a place the summary does not
+    /// report is the failure mode this tool exists to prevent.
+    pub symlinked_pngs: u64,
+}
+
 /// Every `.png` under `root`, excluding this program's own output folders, in
 /// sorted order.
 ///
@@ -16,8 +28,9 @@ use std::path::{Path, PathBuf};
 /// both without touching the target — a junction pointing at an ancestor
 /// (common in real Windows user profiles) would otherwise make the scan re-read
 /// the same subtree forever, since nothing else here tracks visited paths.
-pub fn candidates(root: &Path) -> Vec<PathBuf> {
+pub fn candidates(root: &Path) -> Scan {
     let mut out = Vec::new();
+    let mut symlinked_pngs = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -31,6 +44,14 @@ pub fn candidates(root: &Path) -> Vec<PathBuf> {
                 // point) — never descend, and never treat it as a candidate
                 // file either. Cheap: no extra filesystem call, and it is
                 // exactly what stops a cycle back to an ancestor.
+                //
+                // One that looks like a card is counted on the way past, so the
+                // summary can say it was skipped. The extension is all that is
+                // consulted: asking what the link points at would mean following
+                // the link this guard exists to refuse.
+                if has_png_extension(&path) {
+                    symlinked_pngs += 1;
+                }
                 continue;
             }
             if ft.is_dir() {
@@ -46,7 +67,7 @@ pub fn candidates(root: &Path) -> Vec<PathBuf> {
     // within a directory) is not meaningful on its own — pin down the
     // documented "deterministic order" by sorting the whole result once.
     out.sort();
-    out
+    Scan { files: out, symlinked_pngs }
 }
 
 fn has_png_extension(p: &Path) -> bool {
@@ -69,6 +90,7 @@ mod tests {
 
     fn names(root: &Path) -> Vec<String> {
         let mut v: Vec<String> = candidates(root)
+            .files
             .iter()
             .map(|p| {
                 p.strip_prefix(root)
@@ -121,7 +143,79 @@ mod tests {
     #[test]
     fn an_empty_root_yields_nothing() {
         let d = Dir::new();
-        assert!(candidates(d.path()).is_empty());
+        let scan = candidates(d.path());
+        assert!(scan.files.is_empty());
+        assert_eq!(scan.symlinked_pngs, 0);
+    }
+
+    /// A symlinked `.png` is not descended into or moved — following links is
+    /// what the reparse-point guard refuses to do — but it must not vanish from
+    /// the accounting. Being skipped silently puts a card-shaped file in a place
+    /// no counter reports, which is the failure this whole tool is about.
+    #[test]
+    fn a_symlinked_png_is_skipped_but_counted() {
+        let d = Dir::new();
+        touch(d.path(), "real.png");
+        touch(d.path(), "target/actual.png");
+        let link = d.path().join("linked.png");
+
+        if !make_png_link(&link, &d.path().join("target").join("actual.png"), &d.path().join("target")) {
+            eprintln!(
+                "note: skipping a_symlinked_png_is_skipped_but_counted — this environment \
+                 allowed neither a file symlink nor a junction; the counter in `candidates` \
+                 is still in place, just unverified by this run"
+            );
+            return;
+        }
+
+        let scan = candidates(d.path());
+        let mut got: Vec<String> = scan
+            .files
+            .iter()
+            .map(|p| p.strip_prefix(d.path()).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        got.sort();
+
+        // Unlink before asserting, so a failure still leaves no reparse point
+        // behind for `Dir`'s recursive delete to walk through.
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir(&link);
+
+        assert_eq!(got, ["real.png", "target/actual.png"], "the link itself is not a candidate");
+        assert_eq!(scan.symlinked_pngs, 1, "but it is counted");
+    }
+
+    /// Create a reparse point at `link`, whose name ends in `.png`.
+    ///
+    /// A real file symlink is what this is about, but on Windows that needs
+    /// Developer Mode or elevation, which routinely is not available — so fall
+    /// back to a directory junction, which needs neither. The guard cannot tell
+    /// them apart and is not meant to: `FileType::is_symlink` is true for
+    /// `IO_REPARSE_TAG_SYMLINK` and `IO_REPARSE_TAG_MOUNT_POINT` alike, and the
+    /// counter keys off that plus the `.png` name. Either way the branch under
+    /// test is the one that really runs.
+    #[cfg(windows)]
+    fn make_png_link(link: &Path, file_target: &Path, dir_target: &Path) -> bool {
+        if std::os::windows::fs::symlink_file(file_target, link).is_ok() {
+            return true;
+        }
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(dir_target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn make_png_link(link: &Path, file_target: &Path, _dir_target: &Path) -> bool {
+        std::os::unix::fs::symlink(file_target, link).is_ok()
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    fn make_png_link(_link: &Path, _file_target: &Path, _dir_target: &Path) -> bool {
+        false
     }
 
     /// `is_in_dest_folder` uses `strip_prefix`, which fails outright (returning
@@ -316,6 +410,7 @@ mod tests {
         touch(d.path(), "m.png");
 
         let raw: Vec<String> = candidates(d.path())
+            .files
             .iter()
             .map(|p| {
                 p.strip_prefix(d.path())
