@@ -22,6 +22,10 @@ koikatsu-hamster [--root <dir>] [--dry-run] [search term]
   search term    cards whose full name contains it are filed one level deeper
 ```
 
+The search term becomes a folder name, so it has to be one: a term containing a path separator
+or `..` is a usage error (exit 2) rather than something that quietly files matched cards
+somewhere else entirely.
+
 The run ends with a summary of what moved and what was left alone. It pauses for a keypress only
 when stdin is a terminal, so it can be called from a script; the exit code is 1 if any file
 errored, otherwise 0. A `--root` that doesn't exist or can't be read is reported on stderr and
@@ -48,6 +52,12 @@ directory filter is.
   `Unknown` is not among them.
 - Unrecognized markers and parse failures are **printed and counted** instead of silently
   skipped, with a summary at the end of the run.
+- A file that cannot be **read** — permission denied, a sharing violation because the card is
+  open in the character maker, a network share that blinked — is reported as an error, never
+  quietly counted as an ordinary image.
+- Every other way a card-shaped file can be passed over gets a summary line too: one already
+  sitting in the folder it would be moved to (`already in place`), and one the walk refuses to
+  follow because it is a symlink or reparse point (`symlinked .png files`).
 - `【EroMakeChara】` (Emotion Creators) is recognized, so unconverted cards are visible rather
   than left behind without a word.
 - KStudio scene cards are recognized and counted, so they no longer drown out that report. They
