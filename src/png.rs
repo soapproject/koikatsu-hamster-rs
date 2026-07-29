@@ -87,9 +87,18 @@ mod tests {
     /// hamster scanned for the 8 IEND bytes through a 4096-byte sliding window and
     /// mishandled a match that straddled the boundary. Walking the chunk chain has
     /// no window at all; this pins that the offset is right anyway.
+    ///
+    /// In this fixture the IEND chunk's 8-byte header (4-byte zero length + "IEND"
+    /// type) starts at offset `45 + pad` (signature 8 + IHDR chunk 25 + IDAT chunk
+    /// overhead 12 = 45 bytes before the IDAT filler), so its type field lands at
+    /// `49 + pad`. A single hardcoded `pad` would only prove the boundary case if
+    /// that arithmetic is exactly right, so instead sweep `pad` across a range wide
+    /// enough to bracket any 4096-byte boundary crossing regardless of exactly
+    /// which bytes a sliding-window scanner treats as "the window", and regardless
+    /// of small future changes to this fixture's chunk layout.
     #[test]
     fn iend_straddling_a_4096_byte_boundary_is_still_found() {
-        for pad in 4070..4100 {
+        for pad in 4000..4200 {
             let (_d, p) = write(&png(&vec![7u8; pad], b"PAYLOAD"));
             let (off, len) = payload_span(&p).unwrap_or_else(|| panic!("pad {pad}"));
             assert_eq!(len, 7, "pad {pad}");
@@ -117,7 +126,8 @@ mod tests {
     #[test]
     fn a_chunk_length_running_past_eof_is_none() {
         let mut bytes = png(&[7; 10], b"");
-        // Overwrite the IDAT length with something enormous.
+        // Overwrite the IHDR length (the first chunk after the 8-byte signature,
+        // at offset 8..12) with something enormous.
         bytes[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
         let (_d, p) = write(&bytes);
         assert_eq!(payload_span(&p), None);
