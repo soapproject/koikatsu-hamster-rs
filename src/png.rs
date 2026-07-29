@@ -1,6 +1,5 @@
 //! Locate the block Koikatsu appends after a PNG's first IEND chunk.
 
-use std::fs::File;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
 
 const SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -25,14 +24,19 @@ const SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 ///   a texture and still exit 0 — the exact silent drop this rewrite exists to
 ///   kill.
 ///
-/// Takes an already-open handle so the caller can go on to read the payload from
-/// the same one, instead of opening the same path twice and getting a different
-/// file the second time.
-pub fn payload_span(f: &mut File) -> io::Result<Option<(u64, u64)>> {
-    let file_len = f.metadata()?.len();
-    f.seek(SeekFrom::Start(0))?;
+/// Generic over `Read + Seek` rather than `&mut File` so a test can drive it from
+/// an in-memory `Cursor` — that is how the byte-count regression test proves what
+/// the real parse touches without writing a multi-megabyte fixture to disk. Takes
+/// an already-open handle so the caller can go on to read the payload from the
+/// same one, instead of opening the same path twice and getting a different file
+/// the second time.
+pub fn payload_span<R: Read + Seek>(r: &mut R) -> io::Result<Option<(u64, u64)>> {
+    // No `metadata()` on a generic `Read + Seek`, so the length comes from
+    // seeking to the end and back — the same trick a lazy `BinaryReader` uses.
+    let file_len = r.seek(SeekFrom::End(0))?;
+    r.seek(SeekFrom::Start(0))?;
     let mut sig = [0u8; 8];
-    if !read_or_eof(f, &mut sig)? {
+    if !read_or_eof(r, &mut sig)? {
         return Ok(None); // shorter than a PNG signature
     }
     if sig != SIG {
@@ -41,7 +45,7 @@ pub fn payload_span(f: &mut File) -> io::Result<Option<(u64, u64)>> {
     let mut off: u64 = 8;
     loop {
         let mut hdr = [0u8; 8];
-        if !read_or_eof(f, &mut hdr)? {
+        if !read_or_eof(r, &mut hdr)? {
             return Ok(None); // chunk chain ends mid-header
         }
         let ln = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
@@ -53,7 +57,7 @@ pub fn payload_span(f: &mut File) -> io::Result<Option<(u64, u64)>> {
         if is_iend {
             return Ok(Some((next, file_len - next)));
         }
-        f.seek(SeekFrom::Start(next))?;
+        r.seek(SeekFrom::Start(next))?;
         off = next;
     }
 }
@@ -61,8 +65,8 @@ pub fn payload_span(f: &mut File) -> io::Result<Option<(u64, u64)>> {
 /// `Ok(true)` when `buf` was filled, `Ok(false)` when the file ended first —
 /// which is a statement about the file's contents, not a read failure. Any other
 /// error is a genuine I/O failure and is propagated.
-fn read_or_eof(f: &mut File, buf: &mut [u8]) -> io::Result<bool> {
-    match f.read_exact(buf) {
+fn read_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
+    match r.read_exact(buf) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(false),
         Err(e) => Err(e),

@@ -4,6 +4,8 @@ mod plan;
 mod png;
 mod walk;
 #[cfg(test)]
+mod counting_reader;
+#[cfg(test)]
 mod fixture;
 #[cfg(test)]
 mod tempdir;

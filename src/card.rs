@@ -202,16 +202,24 @@ impl<'a> Cur<'a> {
 /// file whose *contents* say it is an ordinary image.
 pub fn read_card(path: &Path) -> Result<CardMeta, CardError> {
     let mut f = fs::File::open(path).map_err(|e| CardError::Io(e.to_string()))?;
-    let (off, len) = payload_span(&mut f)
+    read_card_from(&mut f)
+}
+
+// TEMPORARY: this is the ORIGINAL slurping body, only generalised to `R: Read +
+// Seek` so it compiles against the new signature. It exists to prove the byte-
+// count test actually fails against the defect before the streaming rewrite
+// below replaces it — see PERF-REPORT.md for the reading it produced.
+pub fn read_card_from<R: Read + Seek>(r: &mut R) -> Result<CardMeta, CardError> {
+    let (off, len) = payload_span(r)
         .map_err(|e| CardError::Io(e.to_string()))?
         .ok_or(CardError::NotCard)?;
     if len == 0 {
         return Err(CardError::NotCard);
     }
-    f.seek(SeekFrom::Start(off))
+    r.seek(SeekFrom::Start(off))
         .map_err(|e| CardError::Io(e.to_string()))?;
     let mut buf = Vec::new();
-    f.read_to_end(&mut buf)
+    r.read_to_end(&mut buf)
         .map_err(|e| CardError::Io(e.to_string()))?;
 
     let mut c = Cur { b: &buf, p: 0 };
@@ -313,9 +321,33 @@ pub fn read_card(path: &Path) -> Result<CardMeta, CardError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::counting_reader::CountingReader;
     use crate::fixture;
     use crate::tempdir::Dir;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
+
+    /// Guards the point of this whole branch: parsing a card must stream from
+    /// the reader instead of slurping the entire appended payload into memory.
+    /// The 16 MiB tail below sits after the Parameter block — nothing a correct
+    /// parse needs — mirroring how a real card's face image and any padding
+    /// after it dwarf the handful of bytes `read_card_from` actually needs.
+    #[test]
+    fn parsing_a_card_does_not_read_its_whole_payload() {
+        let mut bytes = fixture::card("【KoiKatuChara】", 1, "姬野", "夜王");
+        bytes.extend(std::iter::repeat(0u8).take(16 * 1024 * 1024));
+        let mut cr = CountingReader::new(Cursor::new(bytes));
+
+        let m = read_card_from(&mut cr).expect("card");
+
+        assert_eq!(m.game, Game::Koikatu);
+        assert_eq!(m.sex, Sex::Female);
+        assert_eq!(m.fullname(), "姬野 夜王");
+        assert!(
+            cr.bytes_read() < 256 * 1024,
+            "expected under 256 KiB actually read, got {} bytes",
+            cr.bytes_read()
+        );
+    }
 
     fn file(d: &Dir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let p = d.path().join(name);
