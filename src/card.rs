@@ -358,15 +358,13 @@ mod tests {
     /// of the version string's own bytes as a length prefix — it needs enough
     /// trailing bytes present to complete without truncating, so it can fail to
     /// recognise the garbage marker and fall through to the probe, rather than
-    /// erroring out as `Malformed` before the probe ever runs. `fixture::scene`'s
-    /// minimal payload is real card size; pad it out here so this stays a test of
-    /// scene detection, not of the fixture's brevity.
+    /// erroring out as `Malformed` before the probe ever runs. `fixture::scene`
+    /// pads its own payload for exactly this reason, so this is a test of scene
+    /// detection, not of the fixture's brevity.
     #[test]
     fn a_scene_card_is_recognized_by_its_version_string() {
         let d = Dir::new();
-        let mut bytes = fixture::scene("1.0.4.2");
-        bytes.extend(std::iter::repeat(0u8).take(128));
-        let p = file(&d, "a.png", &bytes);
+        let p = file(&d, "a.png", &fixture::scene("1.0.4.2"));
         match read_card(&p) {
             Err(CardError::Scene(v)) => assert_eq!(v, "1.0.4.2"),
             other => panic!("expected Scene, got {other:?}"),

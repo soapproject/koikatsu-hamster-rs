@@ -39,7 +39,14 @@ impl Args {
                 "--dry-run" => a.dry_run = true,
                 "--root" => {
                     i += 1;
-                    let v = argv.get(i).ok_or("--root needs a directory")?;
+                    // A value that itself looks like a flag (e.g. `--root --dry-run`)
+                    // is rejected the same way a missing value is: silently treating
+                    // it as the root would send the walk into a directory that
+                    // doesn't exist and no-op the whole run without a word.
+                    let v = argv
+                        .get(i)
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or("--root needs a directory")?;
                     a.root = Some(PathBuf::from(v));
                 }
                 other if other.starts_with("--") => {
@@ -112,7 +119,16 @@ pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write
             .replace('\\', "/");
 
         if dry_run {
-            let _ = writeln!(out, "Move file: {} to {}", name, dir.join(&name).display());
+            // Preview the same free_name collision check a real move would use, so
+            // the dry run reports the name a real run would actually produce
+            // rather than always the bare name. Honest limitation: nothing is
+            // written to disk during a dry run, so free_name can only see files
+            // that already existed before this run started — two source files
+            // that would collide with EACH OTHER within the same dry run both
+            // preview the same free name, because neither one's previewed move
+            // ever "happens" on disk for the other to see.
+            let preview = free_name(&dir, &name);
+            let _ = writeln!(out, "Move file: {} to {}", name, preview.display());
             rep.record(rel);
             continue;
         }
@@ -132,6 +148,17 @@ pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write
         rep.record(rel);
     }
     rep
+}
+
+/// Checked separately from the run loop so a typoed or unreadable `--root`
+/// produces a clear diagnostic and a non-zero exit instead of a banner, an empty
+/// summary, and an exit code that tells the user everything succeeded.
+fn check_root(root: &Path) -> Result<(), String> {
+    match std::fs::metadata(root) {
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(format!("--root {} is not a directory", root.display())),
+        Err(e) => Err(format!("--root {} is not accessible: {e}", root.display())),
+    }
 }
 
 fn print_summary(rep: &Report, out: &mut dyn Write) {
@@ -167,6 +194,11 @@ fn main() {
         .root
         .clone()
         .unwrap_or_else(|| std::env::current_dir().expect("current directory"));
+    if let Err(e) = check_root(&root) {
+        let _ = out.flush();
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
     let rep = run(&root, args.dry_run, args.search.as_deref(), &mut out);
     print_summary(&rep, &mut out);
     if args.dry_run {
@@ -217,6 +249,19 @@ mod tests {
     }
 
     #[test]
+    fn a_root_value_that_looks_like_a_flag_is_rejected_rather_than_swallowed() {
+        assert!(args(&["--root", "--dry-run"]).is_err());
+    }
+
+    #[test]
+    fn a_nonexistent_root_is_reported_rather_than_silently_producing_an_empty_run() {
+        let d = Dir::new();
+        let missing = d.path().join("does-not-exist");
+        let err = check_root(&missing).unwrap_err();
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+    }
+
+    #[test]
     fn an_unknown_flag_is_an_error() {
         assert!(args(&["--recursive"]).is_err());
     }
@@ -235,13 +280,7 @@ mod tests {
         write(r, "boy.png", &fixture::card("【KoiKatuChara】", 0, "a", "b"));
         write(r, "outfit.png", &fixture::card("【KoiKatuClothes】", 1, "", ""));
         write(r, "ec.png", &fixture::card("【EroMakeChara】", 1, "", ""));
-        // fixture::scene's minimal payload isn't long enough for the marker-first
-        // read to fail without truncating and fall through to the scene probe (see
-        // card::tests::a_scene_card_is_recognized_by_its_version_string); pad it
-        // out here for the same reason.
-        let mut scene_bytes = fixture::scene("1.0.4.2");
-        scene_bytes.extend(std::iter::repeat(0u8).take(128));
-        write(r, "scene.png", &scene_bytes);
+        write(r, "scene.png", &fixture::scene("1.0.4.2"));
         write(r, "texture.png", &fixture::plain_png());
         write(r, "future.png", &fixture::card("【SomeFutureGame】", 1, "", ""));
 
@@ -279,6 +318,40 @@ mod tests {
         assert_eq!(rep.moved.iter().map(|(_, n)| n).sum::<u64>(), 1);
         assert!(r.join("girl.png").exists(), "dry run must not move");
         assert!(!r.join("Koikatu/Female/girl.png").exists());
+    }
+
+    /// A dry run must preview the name a real run would actually produce, not
+    /// always the bare name — so it has to run the same free_name collision check
+    /// a real move uses. Two cards share a file name ("dup.png") from different
+    /// source folders, one Female and one Male, so they land in different
+    /// destination folders and don't collide with each other; only the Male one
+    /// collides, with a file already sitting on disk at its destination (as if
+    /// left over from an earlier run). The preview must show the plain name for
+    /// the Female card and the counter-suffixed name for the Male one.
+    #[test]
+    fn a_dry_run_previews_the_free_name_against_files_already_on_disk() {
+        let d = Dir::new();
+        let r = d.path();
+        write(r, "one/dup.png", &fixture::card("【KoiKatuChara】", 1, "a", "b")); // Female
+        write(r, "two/dup.png", &fixture::card("【KoiKatuChara】", 0, "c", "d")); // Male
+        std::fs::create_dir_all(r.join("Koikatu").join("Male")).unwrap();
+        std::fs::write(r.join("Koikatu").join("Male").join("dup.png"), b"already here").unwrap();
+
+        let mut out = Vec::new();
+        let rep = run(r, true, None, &mut out);
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(&format!("to {}", r.join("Koikatu").join("Female").join("dup.png").display())),
+            "expected the plain name for the non-colliding card: {text}"
+        );
+        assert!(
+            text.contains(&format!("to {}", r.join("Koikatu").join("Male").join("dup(1).png").display())),
+            "expected the counter-suffixed name for the colliding card: {text}"
+        );
+        assert_eq!(rep.moved.iter().map(|(_, n)| n).sum::<u64>(), 2);
+        assert!(r.join("one").join("dup.png").exists(), "dry run must not move");
+        assert!(r.join("two").join("dup.png").exists(), "dry run must not move");
     }
 
     #[test]

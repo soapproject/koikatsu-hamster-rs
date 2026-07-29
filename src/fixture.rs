@@ -113,9 +113,23 @@ pub fn card(marker: &str, sex: u8, lastname: &str, firstname: &str) -> Vec<u8> {
 /// A KStudio scene card: where a chara card has a marker, a scene has a version
 /// string. That difference is the only reliable way to tell them apart, because a
 /// scene embeds the characters it uses and therefore contains the chara marker too.
+///
+/// `read_card` always attempts the marker read first (a `ProductNo` i32, then a
+/// length-prefixed string) and only falls back to the scene probe when that read
+/// finds a marker that isn't in the table — never when the read itself fails. On a
+/// scene payload, that "marker" read starts 4 bytes into the version string and
+/// treats whatever byte lands there as a length prefix, so it needs enough
+/// trailing bytes to satisfy any length 0..=127 could claim, or it errors out as
+/// `Malformed` before the probe ever runs and this stops being a scene fixture at
+/// all. Real scene cards carry an entire scene blob, so they are never this
+/// short; the padding below is what keeps a short version string like `"1.0.4.2"`
+/// from making a fixture accidentally exercise the `Malformed` path instead of the
+/// scene one it's meant for. Every caller gets this for free — nobody needs to
+/// remember to pad at the call site.
 pub fn scene(version: &str) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend(dotnet_string(version));
     p.extend_from_slice(b"\x00\x01scene payload");
+    p.extend(std::iter::repeat(0u8).take(128));
     png_with(&p)
 }
