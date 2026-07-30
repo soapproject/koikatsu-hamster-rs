@@ -42,7 +42,7 @@ pub struct Scan {
 /// both without touching the target — a junction pointing at an ancestor
 /// (common in real Windows user profiles) would otherwise make the scan re-read
 /// the same subtree forever, since nothing else here tracks visited paths.
-pub fn candidates(root: &Path) -> Scan {
+pub fn candidates(root: &Path, any_ext: bool) -> Scan {
     let mut out = Vec::new();
     let mut symlinked_pngs = 0u64;
     let mut excluded_dirs = Vec::new();
@@ -69,7 +69,7 @@ pub fn candidates(root: &Path) -> Scan {
                 // summary can say it was skipped. The extension is all that is
                 // consulted: asking what the link points at would mean following
                 // the link this guard exists to refuse.
-                if has_png_extension(&path) {
+                if is_candidate(&path, any_ext) {
                     symlinked_pngs += 1;
                 }
                 continue;
@@ -82,7 +82,7 @@ pub fn candidates(root: &Path) -> Scan {
                 } else {
                     stack.push(path);
                 }
-            } else if ft.is_file() && has_png_extension(&path) {
+            } else if ft.is_file() && is_candidate(&path, any_ext) {
                 out.push(path);
             }
         }
@@ -103,6 +103,13 @@ fn has_png_extension(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// What the walk will pick up. One function so the file branch and the
+/// reparse-point counter cannot drift apart: a link the run would have examined
+/// has to be counted whichever setting made it a candidate.
+fn is_candidate(p: &Path, any_ext: bool) -> bool {
+    any_ext || has_png_extension(p)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -116,7 +123,7 @@ pub(crate) mod tests {
     }
 
     fn names(root: &Path) -> Vec<String> {
-        let mut v: Vec<String> = candidates(root)
+        let mut v: Vec<String> = candidates(root, false)
             .files
             .iter()
             .map(|p| {
@@ -170,7 +177,7 @@ pub(crate) mod tests {
     #[test]
     fn an_empty_root_yields_nothing() {
         let d = Dir::new();
-        let scan = candidates(d.path());
+        let scan = candidates(d.path(), false);
         assert!(scan.files.is_empty());
         assert_eq!(scan.symlinked_pngs, 0);
     }
@@ -186,7 +193,7 @@ pub(crate) mod tests {
         touch(d.path(), "target/actual.png");
         let link = d.path().join("linked.png");
 
-        if !make_png_link(&link, &d.path().join("target").join("actual.png"), &d.path().join("target")) {
+        if !make_file_link(&link, &d.path().join("target").join("actual.png"), &d.path().join("target")) {
             eprintln!(
                 "note: skipping a_symlinked_png_is_skipped_but_counted — this environment \
                  allowed neither a file symlink nor a junction; the counter in `candidates` \
@@ -195,7 +202,7 @@ pub(crate) mod tests {
             return;
         }
 
-        let scan = candidates(d.path());
+        let scan = candidates(d.path(), false);
         let mut got: Vec<String> = scan
             .files
             .iter()
@@ -212,6 +219,62 @@ pub(crate) mod tests {
         assert_eq!(scan.symlinked_pngs, 1, "but it is counted");
     }
 
+    /// Off by default the candidate set is exactly `.png`, unchanged. On, every
+    /// regular file is a candidate — for a batch where a card is suspected of
+    /// having been renamed, at the cost of opening every texture in the tree.
+    #[test]
+    fn any_extension_widens_the_candidate_set_without_changing_the_default() {
+        let d = Dir::new();
+        touch(d.path(), "card.png");
+        touch(d.path(), "renamed.jpg");
+        touch(d.path(), "notes.txt");
+
+        let mut off: Vec<String> = candidates(d.path(), false)
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        off.sort();
+        assert_eq!(off, ["card.png"]);
+
+        let mut on: Vec<String> = candidates(d.path(), true)
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        on.sort();
+        assert_eq!(on, ["card.png", "notes.txt", "renamed.jpg"]);
+    }
+
+    /// The reparse-point counter uses the SAME candidate test, not `.png`
+    /// unconditionally: with `--any-extension` on, a symlinked `x.jpg` is a file
+    /// the run would otherwise have examined, so it belongs in the count for the
+    /// same reason a symlinked `.png` does.
+    #[test]
+    fn the_symlink_counter_follows_the_candidate_test() {
+        let d = Dir::new();
+        touch(d.path(), "target/actual.png");
+        let link = d.path().join("linked.jpg");
+
+        if !make_file_link(&link, &d.path().join("target").join("actual.png"), &d.path().join("target")) {
+            eprintln!(
+                "note: skipping the_symlink_counter_follows_the_candidate_test — this environment \
+                 allowed neither a file symlink nor a junction; the shared candidate test in \
+                 `candidates` is still in place, just unverified by this run"
+            );
+            return;
+        }
+
+        let off = candidates(d.path(), false).symlinked_pngs;
+        let on = candidates(d.path(), true).symlinked_pngs;
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir(&link);
+
+        assert_eq!(off, 0, "a .jpg link is not a candidate by default");
+        assert_eq!(on, 1, "but it is one under --any-extension, so it is counted");
+    }
+
     /// Create a reparse point at `link`, whose name ends in `.png`.
     ///
     /// A real file symlink is what this is about, but on Windows that needs
@@ -222,7 +285,7 @@ pub(crate) mod tests {
     /// counter keys off that plus the `.png` name. Either way the branch under
     /// test is the one that really runs.
     #[cfg(windows)]
-    fn make_png_link(link: &Path, file_target: &Path, dir_target: &Path) -> bool {
+    fn make_file_link(link: &Path, file_target: &Path, dir_target: &Path) -> bool {
         if std::os::windows::fs::symlink_file(file_target, link).is_ok() {
             return true;
         }
@@ -236,12 +299,12 @@ pub(crate) mod tests {
     }
 
     #[cfg(unix)]
-    fn make_png_link(link: &Path, file_target: &Path, _dir_target: &Path) -> bool {
+    fn make_file_link(link: &Path, file_target: &Path, _dir_target: &Path) -> bool {
         std::os::unix::fs::symlink(file_target, link).is_ok()
     }
 
     #[cfg(not(any(windows, unix)))]
-    fn make_png_link(_link: &Path, _file_target: &Path, _dir_target: &Path) -> bool {
+    fn make_file_link(_link: &Path, _file_target: &Path, _dir_target: &Path) -> bool {
         false
     }
 
@@ -436,7 +499,7 @@ pub(crate) mod tests {
         touch(d.path(), "a/deep/inner.png");
         touch(d.path(), "m.png");
 
-        let raw: Vec<String> = candidates(d.path())
+        let raw: Vec<String> = candidates(d.path(), false)
             .files
             .iter()
             .map(|p| {
@@ -466,7 +529,7 @@ pub(crate) mod tests {
         touch(d.path(), "SVC/x.png");
         touch(d.path(), "pack/SVC/y.png");
 
-        let scan = candidates(d.path());
+        let scan = candidates(d.path(), false);
 
         assert_eq!(scan.excluded_dirs, ["SVC"], "the first-level SVC is recorded by name");
         let files: Vec<String> = scan
@@ -484,7 +547,7 @@ pub(crate) mod tests {
         let d = Dir::new();
         touch(d.path(), "a.png");
         touch(d.path(), "sub/b.png");
-        assert!(candidates(d.path()).excluded_dirs.is_empty());
+        assert!(candidates(d.path(), false).excluded_dirs.is_empty());
     }
 
     /// A directory the walk cannot list must not disappear. The scan still
@@ -507,7 +570,7 @@ pub(crate) mod tests {
             return;
         }
 
-        let scan = candidates(d.path());
+        let scan = candidates(d.path(), false);
 
         // Restore before asserting, so a failure still leaves a tree `Dir` can delete.
         restore_read(&locked);

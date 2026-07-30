@@ -15,11 +15,13 @@ like the C# version. It walks that folder and everything under it, and files eac
 `[Game]/[Female|Male|Coordinate|Character]`.
 
 ```
-koikatsu-hamster [--root <dir>] [--dry-run] [search term]
+koikatsu-hamster [--root <dir>] [--dry-run] [--any-extension] [search term]
 
-  --root <dir>   directory to organise (default: the current directory)
-  --dry-run      report what would move, change nothing
-  search term    cards whose full name contains it are filed one level deeper
+  --root <dir>       directory to organise (default: the current directory)
+  --dry-run          report what would move, change nothing
+  --any-extension    examine every file, not just *.png — for a batch where a
+                     card is suspected of having been renamed
+  search term        cards whose full name contains it are filed one level deeper
 ```
 
 The search term becomes a folder name, so it has to be one: a term containing a path separator
@@ -58,6 +60,15 @@ directory filter is.
 - Every other way a card-shaped file can be passed over gets a summary line too: one already
   sitting in the folder it would be moved to (`already in place`), and one the walk refuses to
   follow because it is a symlink or reparse point (`symlinked .png files`).
+- A first-level folder skipped by the exclusion rule is **named** in the summary
+  (`skipped output folders`). Skipping it is deliberate — that is how the tool stays
+  idempotent over its own output — but a downloaded pack that unpacks to `SVC/` looks
+  exactly like an output folder, and the name is what lets you tell them apart.
+- A directory the scan **cannot read** is reported per directory and counted as an error,
+  matching the rule for a file it cannot read. The walk still continues past it.
+- `--any-extension` examines every file rather than just `*.png`, for a batch where a card
+  is suspected of having been renamed. Off by default: with it on, every texture and readme
+  in the tree is opened and probed.
 - `【EroMakeChara】` (Emotion Creators) is recognized, so unconverted cards are visible rather
   than left behind without a word.
 - KStudio scene cards are recognized and counted, so they no longer drown out that report. They

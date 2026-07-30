@@ -20,11 +20,13 @@ use std::path::{Path, PathBuf};
 const VERSION_BANNER: &str = "koikatsu-hamster 0.1.0 (rust)";
 
 const USAGE: &str = "\
-usage: koikatsu-hamster [--root <dir>] [--dry-run] [search term]
+usage: koikatsu-hamster [--root <dir>] [--dry-run] [--any-extension] [search term]
 
-  --root <dir>   directory to organise (default: the current directory)
-  --dry-run      report what would move, change nothing
-  search term    cards whose full name contains it are filed one level deeper
+  --root <dir>       directory to organise (default: the current directory)
+  --dry-run          report what would move, change nothing
+  --any-extension    examine every file, not just *.png — for a batch where a
+                     card is suspected of having been renamed
+  search term        cards whose full name contains it are filed one level deeper
 ";
 
 #[derive(Debug, Default, PartialEq)]
@@ -32,6 +34,7 @@ pub struct Args {
     pub root: Option<PathBuf>,
     pub dry_run: bool,
     pub search: Option<String>,
+    pub any_ext: bool,
 }
 
 impl Args {
@@ -41,6 +44,7 @@ impl Args {
         while i < argv.len() {
             match argv[i].as_str() {
                 "--dry-run" => a.dry_run = true,
+                "--any-extension" => a.any_ext = true,
                 "--root" => {
                     i += 1;
                     // A value that itself looks like a flag (e.g. `--root --dry-run`)
@@ -178,9 +182,15 @@ fn parse_all(files: &[PathBuf]) -> Vec<Result<card::CardMeta, CardError>> {
         .collect()
 }
 
-pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write) -> Report {
+pub fn run(
+    root: &Path,
+    dry_run: bool,
+    search: Option<&str>,
+    any_ext: bool,
+    out: &mut dyn Write,
+) -> Report {
     let mut rep = Report::default();
-    let mut scan = walk::candidates(root);
+    let mut scan = walk::candidates(root, any_ext);
     rep.symlinked = scan.symlinked_pngs;
     rep.excluded_dirs = std::mem::take(&mut scan.excluded_dirs);
     for (dir, err) in &scan.unreadable_dirs {
@@ -395,7 +405,7 @@ fn main() {
         std::process::exit(1);
     }
     let _ = writeln!(out, "{VERSION_BANNER}");
-    let rep = run(&root, args.dry_run, args.search.as_deref(), &mut out);
+    let rep = run(&root, args.dry_run, args.search.as_deref(), args.any_ext, &mut out);
     print_summary(&rep, &mut out);
     if args.dry_run {
         let _ = writeln!(out, "(dry run — nothing was moved)");
@@ -500,6 +510,12 @@ mod tests {
     #[test]
     fn an_unknown_flag_is_an_error() {
         assert!(args(&["--recursive"]).is_err());
+    }
+
+    #[test]
+    fn any_extension_parses_and_is_off_by_default() {
+        assert!(!args(&[]).unwrap().any_ext);
+        assert!(args(&["--any-extension"]).unwrap().any_ext);
     }
 
     /// The term becomes a path component, so `Path::join` would let it relocate
@@ -607,7 +623,7 @@ mod tests {
         }
 
         let mut out = Vec::new();
-        let rep = run(r, false, None, &mut out);
+        let rep = run(r, false, None, false, &mut out);
         crate::walk::tests::restore_read(&locked);
 
         assert_eq!(rep.unreadable_dirs, 1);
@@ -640,7 +656,7 @@ mod tests {
         write(r, "future.png", &fixture::card("【SomeFutureGame】", 1, "", ""));
 
         let mut out = Vec::new();
-        let rep = run(r, false, None, &mut out);
+        let rep = run(r, false, None, false, &mut out);
 
         assert!(r.join("Koikatu/Female/girl.png").exists());
         assert!(r.join("Koikatu/Male/boy.png").exists());
@@ -668,7 +684,7 @@ mod tests {
         write(r, "girl.png", &fixture::card("【KoiKatuChara】", 1, "a", "b"));
 
         let mut out = Vec::new();
-        let rep = run(r, true, None, &mut out);
+        let rep = run(r, true, None, false, &mut out);
 
         assert_eq!(rep.moved.iter().map(|(_, n)| n).sum::<u64>(), 1);
         assert!(r.join("girl.png").exists(), "dry run must not move");
@@ -693,7 +709,7 @@ mod tests {
         std::fs::write(r.join("Koikatu").join("Male").join("dup.png"), b"already here").unwrap();
 
         let mut out = Vec::new();
-        let rep = run(r, true, None, &mut out);
+        let rep = run(r, true, None, false, &mut out);
 
         let text = String::from_utf8(out).unwrap();
         assert!(
@@ -716,9 +732,9 @@ mod tests {
         write(r, "girl.png", &fixture::card("【KoiKatuChara】", 1, "a", "b"));
 
         let mut out = Vec::new();
-        run(r, false, None, &mut out);
+        run(r, false, None, false, &mut out);
         let mut out2 = Vec::new();
-        let rep = run(r, false, None, &mut out2);
+        let rep = run(r, false, None, false, &mut out2);
         assert_eq!(rep.moved.iter().map(|(_, n)| n).sum::<u64>(), 0);
         assert_eq!(rep.non_cards, 0);
     }
@@ -759,10 +775,10 @@ mod tests {
         write(&root, "Female/girl.png", &fixture::card("【KoiKatuChara】", 1, "a", "b"));
 
         let mut out = Vec::new();
-        let rep1 = run(&root, false, None, &mut out);
+        let rep1 = run(&root, false, None, false, &mut out);
         let after_first = all_pngs(&root);
         let mut out2 = Vec::new();
-        let rep2 = run(&root, false, None, &mut out2);
+        let rep2 = run(&root, false, None, false, &mut out2);
         let after_second = all_pngs(&root);
 
         assert_eq!(rep1.errors, 0);
@@ -810,7 +826,7 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        let rep = run(r, false, None, &mut out);
+        let rep = run(r, false, None, false, &mut out);
         assert!(card.exists(), "still there under its own name");
         assert!(!dest.join("girl(1).png").exists(), "never renamed onto its successor");
         assert_eq!(rep.moved.iter().map(|(_, n)| n).sum::<u64>(), 0);
@@ -824,7 +840,7 @@ mod tests {
         write(r, "two/dup.png", &fixture::card("【KoiKatuChara】", 1, "c", "d"));
 
         let mut out = Vec::new();
-        run(r, false, None, &mut out);
+        run(r, false, None, false, &mut out);
         assert!(r.join("Koikatu/Female/dup.png").exists());
         assert!(r.join("Koikatu/Female/dup(1).png").exists());
     }
@@ -844,7 +860,7 @@ mod tests {
         write(r, "odd.png", &bytes);
 
         let mut out = Vec::new();
-        let rep = run(r, false, None, &mut out);
+        let rep = run(r, false, None, false, &mut out);
 
         assert_eq!(rep.errors, 0, "a placeable card must not fail the run");
         assert!(r.join("Koikatu").join("Unknown").join("odd.png").exists());
@@ -888,7 +904,7 @@ mod tests {
         }
 
         let mut out = Vec::new();
-        let rep = run(r, false, None, &mut out);
+        let rep = run(r, false, None, false, &mut out);
 
         assert_eq!(rep.errors, 0);
         assert!(
@@ -905,7 +921,7 @@ mod tests {
         write(r, "miss.png", &fixture::card("【KoiKatuChara】", 1, "Rika", "Shinozaki"));
 
         let mut out = Vec::new();
-        run(r, false, Some("asuna"), &mut out);
+        run(r, false, Some("asuna"), false, &mut out);
         assert!(r.join("Koikatu/Female/asuna/hit.png").exists());
         assert!(r.join("Koikatu/Female/miss.png").exists());
     }
@@ -929,7 +945,7 @@ mod tests {
             .expect("take an exclusive handle");
 
         let mut out = Vec::new();
-        let rep = run(r, false, None, &mut out);
+        let rep = run(r, false, None, false, &mut out);
 
         assert_eq!(rep.errors, 1, "an unreadable card is an error");
         assert_eq!(rep.non_cards, 0, "and must not be laundered into non-card images");
@@ -946,7 +962,7 @@ mod tests {
         write(r, "broken.png", &bytes);
 
         let mut out = Vec::new();
-        let rep = run(r, false, None, &mut out);
+        let rep = run(r, false, None, false, &mut out);
         assert_eq!(rep.errors, 1);
         assert!(r.join("broken.png").exists());
         let text = String::from_utf8(out).unwrap();
