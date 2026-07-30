@@ -23,6 +23,10 @@ pub struct Scan {
     /// program's own output by name alone, and the name is exactly what lets the
     /// user tell the difference.
     pub excluded_dirs: Vec<String>,
+    /// Directories whose contents could not be listed, with the I/O error. The
+    /// walk continues past them on purpose; what it may not do is leave no trace,
+    /// which contradicts the same spec's rule that an unreadable FILE is an error.
+    pub unreadable_dirs: Vec<(PathBuf, String)>,
 }
 
 /// Every `.png` under `root`, excluding this program's own output folders, in
@@ -42,10 +46,15 @@ pub fn candidates(root: &Path) -> Scan {
     let mut out = Vec::new();
     let mut symlinked_pngs = 0u64;
     let mut excluded_dirs = Vec::new();
+    let mut unreadable_dirs = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                unreadable_dirs.push((dir, e.to_string()));
+                continue;
+            }
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -84,7 +93,8 @@ pub fn candidates(root: &Path) -> Scan {
     out.sort();
     excluded_dirs.sort();
     excluded_dirs.dedup();
-    Scan { files: out, symlinked_pngs, excluded_dirs }
+    unreadable_dirs.sort();
+    Scan { files: out, symlinked_pngs, excluded_dirs, unreadable_dirs }
 }
 
 fn has_png_extension(p: &Path) -> bool {
@@ -94,7 +104,7 @@ fn has_png_extension(p: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tempdir::Dir;
     use std::path::Path;
@@ -476,4 +486,88 @@ mod tests {
         touch(d.path(), "sub/b.png");
         assert!(candidates(d.path()).excluded_dirs.is_empty());
     }
+
+    /// A directory the walk cannot list must not disappear. The scan still
+    /// continues past it — one unreadable folder is not a reason to abandon the
+    /// walk — but it is recorded, because an unreadable folder may hide any
+    /// number of cards and nothing else in the program can say so.
+    #[test]
+    fn an_unreadable_directory_is_recorded_and_the_rest_of_the_scan_continues() {
+        let d = Dir::new();
+        touch(d.path(), "readable/keep.png");
+        touch(d.path(), "locked/hidden.png");
+        let locked = d.path().join("locked");
+
+        if !deny_read(&locked) {
+            eprintln!(
+                "note: skipping an_unreadable_directory_is_recorded_and_the_rest_of_the_scan_continues \
+                 — this environment would not make a directory unreadable; the recording in \
+                 `candidates` is still in place, just unverified by this run"
+            );
+            return;
+        }
+
+        let scan = candidates(d.path());
+
+        // Restore before asserting, so a failure still leaves a tree `Dir` can delete.
+        restore_read(&locked);
+
+        assert_eq!(scan.unreadable_dirs.len(), 1, "the locked folder is recorded");
+        assert_eq!(scan.unreadable_dirs[0].0, locked);
+        let files: Vec<String> = scan
+            .files
+            .iter()
+            .map(|p| p.strip_prefix(d.path()).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(files, ["readable/keep.png"], "the readable sibling is still scanned");
+    }
+
+    /// Make `dir` unlistable, or return false if this environment will not allow
+    /// it. The precondition is VERIFIED, not assumed: an ACL that was applied but
+    /// does not bite — an elevated process, a filesystem that ignores it — would
+    /// otherwise let the test pass while testing nothing, which is the exact
+    /// failure mode this whole change is about.
+    #[cfg(windows)]
+    pub(crate) fn deny_read(dir: &Path) -> bool {
+        let Ok(user) = std::env::var("USERNAME") else { return false };
+        let applied = std::process::Command::new("icacls")
+            .arg(dir)
+            .args(["/deny", &format!("{user}:(RX)")])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        applied && std::fs::read_dir(dir).is_err()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn restore_read(dir: &Path) {
+        let Ok(user) = std::env::var("USERNAME") else { return };
+        let _ = std::process::Command::new("icacls")
+            .arg(dir)
+            .args(["/remove:d", &user])
+            .output();
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn deny_read(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).is_err() {
+            return false;
+        }
+        std::fs::read_dir(dir).is_err()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn restore_read(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    pub(crate) fn deny_read(_dir: &Path) -> bool {
+        false
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    pub(crate) fn restore_read(_dir: &Path) {}
 }

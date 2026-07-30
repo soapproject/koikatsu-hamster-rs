@@ -113,6 +113,9 @@ pub struct Report {
     /// the rule is deliberate — but the same principle as `already_filed` and
     /// `symlinked`: passed over on purpose, never passed over in silence.
     pub excluded_dirs: Vec<String>,
+    /// Directories the scan could not list. Counted as errors as well, so the
+    /// exit code reflects a tree that was only partly examined.
+    pub unreadable_dirs: u64,
     pub errors: u64,
 }
 
@@ -180,6 +183,11 @@ pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write
     let mut scan = walk::candidates(root);
     rep.symlinked = scan.symlinked_pngs;
     rep.excluded_dirs = std::mem::take(&mut scan.excluded_dirs);
+    for (dir, err) in &scan.unreadable_dirs {
+        rep.unreadable_dirs += 1;
+        rep.errors += 1;
+        let _ = writeln!(out, "Failed to scan {}: {}", dir.display(), err);
+    }
     let parsed = parse_all(&scan.files);
     // Destinations this run has already created. `create_dir_all` costs a failing
     // create plus a stat every time it is called — ~50 us on Windows — and a run
@@ -349,6 +357,13 @@ fn print_summary(rep: &Report, out: &mut dyn Write) {
         );
     }
     let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "errors", rep.errors);
+    if rep.unreadable_dirs > 0 {
+        let _ = writeln!(
+            out,
+            "  {:<11} {:<26} {:>5}",
+            "", "unreadable folders", rep.unreadable_dirs
+        );
+    }
 }
 
 fn main() {
@@ -521,6 +536,7 @@ mod tests {
             symlinked: 5,
             errors: 6,
             excluded_dirs: vec![],
+            unreadable_dirs: 0,
         };
         let mut out = Vec::new();
         print_summary(&rep, &mut out);
@@ -567,6 +583,42 @@ mod tests {
             !text.contains("skipped output folders"),
             "an always-present empty row is the noise this line must not become:\n{text}"
         );
+    }
+
+    /// An unreadable directory is an error, on the same footing as an unreadable
+    /// file (2026-07-29 design, "Unreadable is not 'not a card'"). A directory can
+    /// hide any number of cards, so a script that trusts the exit code must not be
+    /// told the run succeeded when part of the tree was never examined.
+    #[test]
+    fn an_unreadable_directory_is_reported_and_fails_the_run() {
+        let d = Dir::new();
+        let r = d.path();
+        std::fs::create_dir_all(r.join("locked")).unwrap();
+        std::fs::write(r.join("locked").join("hidden.png"), b"x").unwrap();
+        let locked = r.join("locked");
+
+        if !crate::walk::tests::deny_read(&locked) {
+            eprintln!(
+                "note: skipping an_unreadable_directory_is_reported_and_fails_the_run — this \
+                 environment would not make a directory unreadable; the error accounting in \
+                 `run` is still in place, just unverified by this run"
+            );
+            return;
+        }
+
+        let mut out = Vec::new();
+        let rep = run(r, false, None, &mut out);
+        crate::walk::tests::restore_read(&locked);
+
+        assert_eq!(rep.unreadable_dirs, 1);
+        assert!(rep.errors >= 1, "an unreadable directory is an error");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("Failed to scan"), "reported per directory:\n{text}");
+
+        let mut summary = Vec::new();
+        print_summary(&rep, &mut summary);
+        let text = String::from_utf8(summary).unwrap();
+        assert!(text.contains("unreadable folders"), "and in the summary:\n{text}");
     }
 
     fn write(root: &Path, rel: &str, bytes: &[u8]) {
