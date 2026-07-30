@@ -109,6 +109,10 @@ pub struct Report {
     /// `.png` files the walk refused to follow because they are symlinks or
     /// reparse points. Same reasoning: skipped, but never silently.
     pub symlinked: u64,
+    /// Names of first-level folders the exclusion rule skipped. Not an error —
+    /// the rule is deliberate — but the same principle as `already_filed` and
+    /// `symlinked`: passed over on purpose, never passed over in silence.
+    pub excluded_dirs: Vec<String>,
     pub errors: u64,
 }
 
@@ -173,8 +177,9 @@ fn parse_all(files: &[PathBuf]) -> Vec<Result<card::CardMeta, CardError>> {
 
 pub fn run(root: &Path, dry_run: bool, search: Option<&str>, out: &mut dyn Write) -> Report {
     let mut rep = Report::default();
-    let scan = walk::candidates(root);
+    let mut scan = walk::candidates(root);
     rep.symlinked = scan.symlinked_pngs;
+    rep.excluded_dirs = std::mem::take(&mut scan.excluded_dirs);
     let parsed = parse_all(&scan.files);
     // Destinations this run has already created. `create_dir_all` costs a failing
     // create plus a stat every time it is called — ~50 us on Windows — and a run
@@ -336,6 +341,13 @@ fn print_summary(rep: &Report, out: &mut dyn Write) {
     let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "unrecognized markers", rep.unrecognized);
     let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "already in place", rep.already_filed);
     let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "symlinked .png files", rep.symlinked);
+    if !rep.excluded_dirs.is_empty() {
+        let _ = writeln!(
+            out,
+            "  {:<11} {:<26} {}",
+            "", "skipped output folders", rep.excluded_dirs.join(", ")
+        );
+    }
     let _ = writeln!(out, "  {:<11} {:<26} {:>5}", "", "errors", rep.errors);
 }
 
@@ -508,6 +520,7 @@ mod tests {
             already_filed: 4,
             symlinked: 5,
             errors: 6,
+            excluded_dirs: vec![],
         };
         let mut out = Vec::new();
         print_summary(&rep, &mut out);
@@ -526,6 +539,34 @@ mod tests {
         for n in ["1", "2", "3", "4", "5", "6"] {
             assert!(text.contains(n), "count {n} missing from:\n{text}");
         }
+    }
+
+    /// A folder the exclusion rule skipped is named in the summary. It is not an
+    /// error — the rule is deliberate — but naming it is the one thing that tells
+    /// the user a downloaded pack called `SVC` was passed over whole.
+    ///
+    /// The line is omitted when there is nothing to report, unlike the counts
+    /// above it: an empty list is the normal case here, and a permanent `0` row
+    /// trains the eye to skip the very row this exists to catch.
+    #[test]
+    fn the_summary_names_excluded_folders_and_omits_the_line_when_there_are_none() {
+        let rep = Report {
+            excluded_dirs: vec!["Koikatu".into(), "SVC".into()],
+            ..Report::default()
+        };
+        let mut out = Vec::new();
+        print_summary(&rep, &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("skipped output folders"), "missing label:\n{text}");
+        assert!(text.contains("Koikatu, SVC"), "missing names:\n{text}");
+
+        let mut empty = Vec::new();
+        print_summary(&Report::default(), &mut empty);
+        let text = String::from_utf8(empty).unwrap();
+        assert!(
+            !text.contains("skipped output folders"),
+            "an always-present empty row is the noise this line must not become:\n{text}"
+        );
     }
 
     fn write(root: &Path, rel: &str, bytes: &[u8]) {

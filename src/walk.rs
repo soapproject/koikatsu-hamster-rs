@@ -13,6 +13,16 @@ pub struct Scan {
     /// them out of every counter is not — a file in a place the summary does not
     /// report is the failure mode this tool exists to prevent.
     pub symlinked_pngs: u64,
+    /// Names of directories directly under the root that the exclusion rule
+    /// rejected, sorted and deduplicated. Recorded where the rule already runs,
+    /// so it costs one push and no filesystem call — and it can only ever hold
+    /// first-level names, because that is all the rule looks at.
+    ///
+    /// Skipping them is deliberate; skipping them without a word is not. A
+    /// downloaded pack that unpacks to `SVC/` is indistinguishable from this
+    /// program's own output by name alone, and the name is exactly what lets the
+    /// user tell the difference.
+    pub excluded_dirs: Vec<String>,
 }
 
 /// Every `.png` under `root`, excluding this program's own output folders, in
@@ -31,6 +41,7 @@ pub struct Scan {
 pub fn candidates(root: &Path) -> Scan {
     let mut out = Vec::new();
     let mut symlinked_pngs = 0u64;
+    let mut excluded_dirs = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -55,7 +66,11 @@ pub fn candidates(root: &Path) -> Scan {
                 continue;
             }
             if ft.is_dir() {
-                if !is_in_dest_folder(root, &path) {
+                if is_in_dest_folder(root, &path) {
+                    if let Some(name) = path.file_name() {
+                        excluded_dirs.push(name.to_string_lossy().into_owned());
+                    }
+                } else {
                     stack.push(path);
                 }
             } else if ft.is_file() && has_png_extension(&path) {
@@ -67,7 +82,9 @@ pub fn candidates(root: &Path) -> Scan {
     // within a directory) is not meaningful on its own — pin down the
     // documented "deterministic order" by sorting the whole result once.
     out.sort();
-    Scan { files: out, symlinked_pngs }
+    excluded_dirs.sort();
+    excluded_dirs.dedup();
+    Scan { files: out, symlinked_pngs, excluded_dirs }
 }
 
 fn has_png_extension(p: &Path) -> bool {
@@ -424,5 +441,39 @@ mod tests {
             raw,
             ["a/deep/inner.png", "a/second.png", "m.png", "z/first.png"]
         );
+    }
+
+    /// The exclusion rule is a deliberate trade-off (see the 2026-07-29 design,
+    /// §Exclusion rule): a first-level folder named after a game is skipped
+    /// whole, even when it is a downloaded pack rather than this program's own
+    /// output. That is defensible only while the run SAYS so — a pack that
+    /// unpacks to `SVC/` must not vanish from the summary as well as from the
+    /// walk. The deeper namesake is asserted in the same test because widening
+    /// the rule while adding the recording is the obvious way to break it.
+    #[test]
+    fn an_excluded_first_level_folder_is_named_and_a_deeper_namesake_is_not() {
+        let d = Dir::new();
+        touch(d.path(), "SVC/x.png");
+        touch(d.path(), "pack/SVC/y.png");
+
+        let scan = candidates(d.path());
+
+        assert_eq!(scan.excluded_dirs, ["SVC"], "the first-level SVC is recorded by name");
+        let files: Vec<String> = scan
+            .files
+            .iter()
+            .map(|p| p.strip_prefix(d.path()).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(files, ["pack/SVC/y.png"], "and only the deeper namesake is still scanned");
+    }
+
+    /// Nothing excluded means nothing recorded — the list is evidence, so it must
+    /// not carry a name on an ordinary run over a freshly unpacked folder.
+    #[test]
+    fn an_ordinary_tree_records_no_excluded_folders() {
+        let d = Dir::new();
+        touch(d.path(), "a.png");
+        touch(d.path(), "sub/b.png");
+        assert!(candidates(d.path()).excluded_dirs.is_empty());
     }
 }
