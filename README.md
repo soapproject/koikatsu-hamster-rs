@@ -29,8 +29,8 @@ or `..` is a usage error (exit 2) rather than something that quietly files match
 somewhere else entirely.
 
 The run ends with a summary of what moved and what was left alone. It pauses for a keypress only
-when stdin is a terminal, so it can be called from a script; the exit code is 1 if any file
-errored, otherwise 0. A `--root` that doesn't exist or can't be read is reported on stderr and
+when stdin is a terminal, so it can be called from a script; the exit code is 1 if any file or
+directory errored, otherwise 0. A `--root` that doesn't exist or can't be read is reported on stderr and
 exits non-zero before anything is scanned, rather than printing an empty summary and exiting 0.
 
 ## Why a rewrite

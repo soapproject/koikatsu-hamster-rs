@@ -540,7 +540,15 @@ mod tests {
     }
 
     /// Every line the summary can carry has to actually appear in it: a count
-    /// kept in `Report` but never printed reports nothing to anybody.
+    /// kept in `Report` but never printed reports nothing to anybody. This covers
+    /// the two newest lines (`skipped output folders`, `unreadable folders`) as
+    /// well as the older counts, and — since both new lines are omitted rather
+    /// than printed as a permanent zero — also asserts that a `Report::default()`
+    /// (nothing excluded, nothing unreadable) prints neither. Doing that here,
+    /// with a hand-built `Report` and no filesystem involved, is what still pins
+    /// the omitted-when-empty case for `unreadable folders` on an environment
+    /// where the ACL-based test below cannot make a directory unreadable and
+    /// returns early.
     #[test]
     fn the_summary_prints_every_count_it_keeps() {
         let rep = Report {
@@ -551,8 +559,8 @@ mod tests {
             already_filed: 4,
             symlinked: 5,
             errors: 6,
-            excluded_dirs: vec![],
-            unreadable_dirs: 0,
+            excluded_dirs: vec!["Koikatu".into(), "SVC".into()],
+            unreadable_dirs: 7,
         };
         let mut out = Vec::new();
         print_summary(&rep, &mut out);
@@ -565,12 +573,27 @@ mod tests {
             "already in place",
             "symlinked .png files",
             "errors",
+            "skipped output folders",
+            "Koikatu, SVC",
+            "unreadable folders",
         ] {
             assert!(text.contains(expected), "{expected} missing from:\n{text}");
         }
-        for n in ["1", "2", "3", "4", "5", "6"] {
+        for n in ["1", "2", "3", "4", "5", "6", "7"] {
             assert!(text.contains(n), "count {n} missing from:\n{text}");
         }
+
+        let mut empty = Vec::new();
+        print_summary(&Report::default(), &mut empty);
+        let text = String::from_utf8(empty).unwrap();
+        assert!(
+            !text.contains("skipped output folders"),
+            "an empty excluded_dirs must not print the line:\n{text}"
+        );
+        assert!(
+            !text.contains("unreadable folders"),
+            "a zero unreadable_dirs must not print the line:\n{text}"
+        );
     }
 
     /// A folder the exclusion rule skipped is named in the summary. It is not an
@@ -737,6 +760,56 @@ mod tests {
         let rep = run(r, false, None, false, &mut out2);
         assert_eq!(rep.moved.iter().map(|(_, n)| n).sum::<u64>(), 0);
         assert_eq!(rep.non_cards, 0);
+        // Pins the `Scan -> Report` wire: `run` copies `scan.excluded_dirs` into
+        // `rep.excluded_dirs` itself, and nothing else in the suite asserts that
+        // line. The first run filed `girl.png` into `Koikatu/Female`, so the
+        // second run's walk finds `Koikatu` as a first-level folder and the
+        // exclusion rule skips it — that name must survive all the way out.
+        assert!(
+            rep.excluded_dirs.contains(&"Koikatu".to_string()),
+            "the excluded dir name must reach the Report the run returns: {:?}",
+            rep.excluded_dirs
+        );
+    }
+
+    /// `--any-extension` end to end: a card whose name doesn't end in `.png` (the
+    /// exact case the flag exists for — a card renamed by a re-encoder or a zip
+    /// tool) is only picked up and actually filed when the flag is on.
+    ///
+    /// `run`'s signature is `(root, dry_run, search, any_ext, out)` — two
+    /// positional `bool`s with only `search` between them, so a transposition
+    /// would compile silently. The second half below, which reruns the same
+    /// fixture with `any_ext = false` and asserts the file is left exactly where
+    /// it was, is what pins the order: if `any_ext` and `dry_run` were ever
+    /// swapped, either this call would stop moving the card (a false `dry_run`)
+    /// or the "off" call below would move it anyway (a stray true `dry_run` on
+    /// the wrong argument), and one of the two halves would fail.
+    #[test]
+    fn any_extension_files_a_renamed_card_end_to_end() {
+        let d = Dir::new();
+        let r = d.path();
+        write(r, "girl.jpg", &fixture::card("【KoiKatuChara】", 1, "a", "b"));
+
+        let mut out = Vec::new();
+        let rep = run(r, false, None, true, &mut out);
+        assert!(
+            r.join("Koikatu").join("Female").join("girl.jpg").exists(),
+            "with --any-extension the renamed card must actually be filed"
+        );
+        assert!(!r.join("girl.jpg").exists(), "and moved away from its original spot");
+        assert_eq!(rep.moved.iter().map(|(_, n)| n).sum::<u64>(), 1);
+
+        let d2 = Dir::new();
+        let r2 = d2.path();
+        write(r2, "girl.jpg", &fixture::card("【KoiKatuChara】", 1, "a", "b"));
+        let mut out2 = Vec::new();
+        let rep2 = run(r2, false, None, false, &mut out2);
+        assert!(
+            r2.join("girl.jpg").exists(),
+            "without the flag a non-.png card is not even a candidate, so it is left alone"
+        );
+        assert!(!r2.join("Koikatu").exists(), "nothing was filed, so no destination folder appears");
+        assert_eq!(rep2.moved.iter().map(|(_, n)| n).sum::<u64>(), 0);
     }
 
     /// Every `.png` under `root`, relative and slash-separated — including the

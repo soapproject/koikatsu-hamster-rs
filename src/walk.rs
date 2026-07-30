@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 pub struct Scan {
     /// Candidate files, in sorted order.
     pub files: Vec<PathBuf>,
-    /// `.png` entries that were skipped because they are symlinks or, on
-    /// Windows, some other reparse point. Skipping them is deliberate; leaving
-    /// them out of every counter is not — a file in a place the summary does not
-    /// report is the failure mode this tool exists to prevent.
+    /// Candidate entries — `.png` files, or every file when `any_ext` is set —
+    /// that were skipped because they are symlinks or, on Windows, some other
+    /// reparse point. Skipping them is deliberate; leaving them out of every
+    /// counter is not — a file in a place the summary does not report is the
+    /// failure mode this tool exists to prevent.
     pub symlinked_pngs: u64,
     /// Names of directories directly under the root that the exclusion rule
     /// rejected, sorted and deduplicated. Recorded where the rule already runs,
@@ -29,13 +30,14 @@ pub struct Scan {
     pub unreadable_dirs: Vec<(PathBuf, String)>,
 }
 
-/// Every `.png` under `root`, excluding this program's own output folders, in
-/// sorted order.
+/// Every candidate file under `root`, excluding this program's own output folders,
+/// in sorted order. A candidate is a `.png` file, or — when `any_ext` is set —
+/// any regular file at all; see `is_candidate`.
 ///
 /// Iterative rather than recursive: a pathological directory tree must not be able
 /// to overflow the stack, for the same reason the msgpack decoder caps its depth.
-/// Directories that cannot be read are skipped — one unreadable folder is not a
-/// reason to abandon the scan.
+/// Directories that cannot be read are recorded in `unreadable_dirs` and the walk
+/// continues past them — one unreadable folder is not a reason to abandon the scan.
 ///
 /// Symlinks and, on Windows, directory junctions are never descended into.
 /// `DirEntry::file_type` does not follow the link, so `is_symlink()` is true for
@@ -275,7 +277,9 @@ pub(crate) mod tests {
         assert_eq!(on, 1, "but it is one under --any-extension, so it is counted");
     }
 
-    /// Create a reparse point at `link`, whose name ends in `.png`.
+    /// Create a reparse point at `link`, whose name ends in `.png` for most
+    /// callers, or another extension for one that exercises the `--any-extension`
+    /// candidate test.
     ///
     /// A real file symlink is what this is about, but on Windows that needs
     /// Developer Mode or elevation, which routinely is not available — so fall
